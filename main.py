@@ -7,6 +7,7 @@ import requests
 import telebot
 from telebot import types
 from dotenv import load_dotenv
+import re
 
 # === ЗАГРУЗКА ПЕРЕМЕННЫХ ИЗ .ENV ===
 load_dotenv()
@@ -23,6 +24,7 @@ ADMIN_IDS = {
 }
 PLUGIN_BASE_URL = "http://c7.play2go.cloud:20795"
 PLUGIN_SECRET = "RrN4Jt9Vq2KpX8mZ"
+CHAT_INVITE_URL = "https://t.me/+15HwEq4ltUJmMTIy"
 
 # === ПУТЬ К БАЗЕ ДАННЫХ ===
 # На хостинге bothost.ru используем /app/data/, локально - текущую папку
@@ -45,6 +47,8 @@ QUESTIONS = [
     ("plans", "7. Имеются ли планы на сервер?", "Кратко опишите планы."),
     ("host", "8. Будет ли возможность скидываться на оплату хоста? (необязательно)", "Если нет — так и ответьте."),
 ]
+
+MINECRAFT_NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 
 
 def db_connect() -> sqlite3.Connection:
@@ -238,6 +242,13 @@ def handle_answer(message, index: int):
         bot.send_message(message.chat.id, "Ник должен быть 3-16 символов.")
         ask_question(message, index)
         return
+    if key == "nick" and not MINECRAFT_NICK_RE.match(text):
+        bot.send_message(
+            message.chat.id,
+            "Ник может содержать только латинские буквы, цифры и _ (3-16 символов).",
+        )
+        ask_question(message, index)
+        return
 
     if not text:
         bot.send_message(message.chat.id, "Ответ не может быть пустым.")
@@ -392,8 +403,10 @@ def on_callback(call):
         try:
             bot.send_message(
                 target_user_id,
-                f"Ваша заявка #{app_id} одобрена. Ник `{nick}` добавлен.",
+                f"Ваша заявка #{app_id} одобрена. Ник `{nick}` добавлен.\n"
+                f"Чат сервера: {CHAT_INVITE_URL}",
                 parse_mode="Markdown",
+                disable_web_page_preview=True,
             )
         except Exception:
             pass
