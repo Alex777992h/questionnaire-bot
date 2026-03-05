@@ -50,6 +50,11 @@ QUESTIONS = [
 
 MINECRAFT_NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 
+BTN_APPLY = "Подать заявку"
+BTN_STATUS = "Статус заявки"
+BTN_ADMIN = "Админ панель"
+BTN_PENDING = "Активные заявки"
+
 
 def db_connect() -> sqlite3.Connection:
     # Создаём папку для БД, если её нет (нужно для локального теста)
@@ -182,12 +187,17 @@ def call_plugin(endpoint: str, nick: str) -> bool:
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(BTN_APPLY, BTN_STATUS)
+    if is_admin(message.from_user.id):
+        keyboard.add(BTN_ADMIN)
     bot.send_message(
         message.chat.id,
         "Привет! Чтобы подать заявку, используй команду:\n"
         "`/apply`\n"
         "Проверить статус: `/status`",
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
 
 
@@ -352,6 +362,31 @@ def cmd_pending(message):
         bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=keyboard)
 
 
+@bot.message_handler(func=lambda m: m.text == BTN_APPLY)
+def on_btn_apply(message):
+    cmd_apply(message)
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_STATUS)
+def on_btn_status(message):
+    cmd_status(message)
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_ADMIN)
+def on_btn_admin(message):
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "Нет прав.")
+        return
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(BTN_PENDING)
+    bot.send_message(message.chat.id, "Админ панель:", reply_markup=keyboard)
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_PENDING)
+def on_btn_pending(message):
+    cmd_pending(message)
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def on_callback(call):
     user_id = call.from_user.id
@@ -403,7 +438,7 @@ def on_callback(call):
         try:
             bot.send_message(
                 target_user_id,
-                f"Ваша заявка #{app_id} одобрена. Ник `{nick}` добавлен.\n"
+                f"Ваша заявка #{app_id} одобрена. Ник `{nick}` добавлен в вайтлист сервера.\n"
                 f"Чат сервера: {CHAT_INVITE_URL}",
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
