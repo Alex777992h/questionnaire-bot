@@ -1,17 +1,23 @@
-﻿import sqlite3
-import time
-import os
+﻿import os
 import json
-import logging
-import socket
+import time
 import re
+import sqlite3
+import logging
 from datetime import datetime
-from typing import Optional, Tuple, List, Dict, Any
-from urllib.parse import urlparse
+from typing import Optional, Tuple, List, Dict
 
-import requests
-import telebot
-from telebot import types
+import aiohttp
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from dotenv import load_dotenv
 
 # === LOAD ENV ===
@@ -62,6 +68,7 @@ PENDING_PAGE_SIZE = int(DEFAULT_CONFIG["pending_page_size"])
 ALERT_COOLDOWN_SECONDS = int(DEFAULT_CONFIG["alert_cooldown_seconds"])
 REASON_TEMPLATES = list(DEFAULT_CONFIG["reason_templates"])
 ARCHIVE_DAYS = int(DEFAULT_CONFIG["archive_days"])
+ENABLE_BUTTON_STYLE = bool(DEFAULT_CONFIG.get("enable_button_style", False))
 
 # === DB PATH ===
 if os.path.exists("/app/data/"):
@@ -76,7 +83,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-bot = telebot.TeleBot(BOT_TOKEN)
+router = Router()
 
 QUESTIONS = [
     ("nick", "1. Ник", "Введите ник (3-16 символов)."),
@@ -111,6 +118,7 @@ BTN_BACK = "⬅️ Назад"
 
 LAST_PLUGIN_ALERT_TS = 0
 PENDING_REJECT_REASON: Dict[int, int] = {}
+PENDING_INPUT_MODE: Dict[int, str] = {}
 
 
 def db_connect() -> sqlite3.Connection:
@@ -195,7 +203,6 @@ def ensure_columns(conn: sqlite3.Connection):
                 conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {col_type}")
             except sqlite3.Error:
                 pass
-
 
 def save_form_state(user_id: int, step: int, data: dict, editing_app_id: Optional[int]):
     with db_connect() as conn:
@@ -313,6 +320,7 @@ def get_pending_count() -> int:
         cur.execute("SELECT COUNT(*) FROM applications WHERE status = 'pending'")
         return cur.fetchone()[0]
 
+
 def get_stats() -> Dict[str, int]:
     with db_connect() as conn:
         cur = conn.cursor()
@@ -333,6 +341,7 @@ def get_stats() -> Dict[str, int]:
         "rejected": rejected,
         "archived": archived,
     }
+
 
 def search_applications(query: str, limit: int = 10) -> List[tuple]:
     q_raw = (query or "").strip()
@@ -371,7 +380,22 @@ def archive_old_applications(days: int) -> int:
         if not rows:
             return 0
         for row in rows:
-            (app_id, user_id, username, nick, q_name, q_age, q_mods, q_voice_listen, q_voice_speak, q_device, q_plans, q_host, status, created_at) = row
+            (
+                app_id,
+                user_id,
+                username,
+                nick,
+                q_name,
+                q_age,
+                q_mods,
+                q_voice_listen,
+                q_voice_speak,
+                q_device,
+                q_plans,
+                q_host,
+                status,
+                created_at,
+            ) = row
             conn.execute(
                 "INSERT OR IGNORE INTO applications_archive "
                 "(id, user_id, username, nick, q_name, q_age, q_mods, q_voice_listen, q_voice_speak, q_device, q_plans, q_host, status, created_at, archived_at) "
@@ -397,81 +421,132 @@ def archive_old_applications(days: int) -> int:
             conn.execute("DELETE FROM applications WHERE id = ?", (app_id,))
         return len(rows)
 
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def call_plugin(endpoint: str, nick: str) -> bool:
-    url = f"{PLUGIN_BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
-    try:
-        resp = requests.post(
-            url,
-            data={"nick": nick, "secret": PLUGIN_SECRET},
-            timeout=5,
-        )
-        return resp.status_code == 200 and resp.text.strip().lower() == "ok"
-    except Exception as e:
-        logging.error("Plugin call error: %s", e)
-        return False
+def button_supports_style() -> bool:
+    fields = getattr(InlineKeyboardButton, "model_fields", None) or getattr(InlineKeyboardButton, "__fields__", None)
+    return bool(fields and "style" in fields)
 
-def maybe_alert_admins(text: str):
-    global LAST_PLUGIN_ALERT_TS
-    now = int(time.time())
-    if now - LAST_PLUGIN_ALERT_TS >= ALERT_COOLDOWN_SECONDS:
-        LAST_PLUGIN_ALERT_TS = now
-        notify_admins(text)
+
+def make_button(text: str, cb: str, style: Optional[str] = None) -> InlineKeyboardButton:
+    kwargs = {"text": text, "callback_data": cb}
+    if style and ENABLE_BUTTON_STYLE and button_supports_style():
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
 
 
 def format_date(ts: int) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
-def build_main_menu(user_id: int) -> types.ReplyKeyboardMarkup:
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(BTN_APPLY, BTN_STATUS)
-    keyboard.add(BTN_HELP)
+def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(text=BTN_APPLY), KeyboardButton(text=BTN_STATUS)],
+        [KeyboardButton(text=BTN_HELP)],
+    ]
     if is_admin(user_id):
-        keyboard.add(BTN_ADMIN)
-    return keyboard
+        keyboard.append([KeyboardButton(text=BTN_ADMIN)])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-def build_admin_menu() -> types.ReplyKeyboardMarkup:
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(BTN_PENDING, BTN_SHOW)
-    keyboard.add(BTN_SEARCH, BTN_STATS)
-    keyboard.add(BTN_HEALTH)
-    keyboard.add(BTN_BAN_USER, BTN_UNBAN_USER)
-    keyboard.add(BTN_BAN_NICK, BTN_UNBAN_NICK)
-    keyboard.add(BTN_ARCHIVE)
-    keyboard.add(BTN_BACK)
-    return keyboard
+def build_admin_menu() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(text=BTN_PENDING), KeyboardButton(text=BTN_SHOW)],
+        [KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_STATS)],
+        [KeyboardButton(text=BTN_HEALTH)],
+        [KeyboardButton(text=BTN_BAN_USER), KeyboardButton(text=BTN_UNBAN_USER)],
+        [KeyboardButton(text=BTN_BAN_NICK), KeyboardButton(text=BTN_UNBAN_NICK)],
+        [KeyboardButton(text=BTN_ARCHIVE)],
+        [KeyboardButton(text=BTN_BACK)],
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-def health_check() -> bool:
+def ask_question(chat_id: int, index: int):
+    if index >= len(QUESTIONS):
+        return None, None
+    key, title, hint = QUESTIONS[index]
+    buttons = []
+    if key in YES_NO_KEYS:
+        buttons.append(
+            [
+                make_button("✅ Да", f"ans:{key}:yes", style="positive"),
+                make_button("❌ Нет", f"ans:{key}:no", style="negative"),
+            ]
+        )
+    buttons.append([make_button("⛔ Отменить", "cancel_form")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    text = f"🧩 *{title}*\n_{hint}_"
+    return keyboard, text
+
+
+def save_and_advance(user, key: str, value: str) -> Optional[int]:
+    state = load_form_state(user.id)
+    if not state:
+        return None
+    step, data, editing_app_id = state
+    expected_key = QUESTIONS[step][0]
+    if key != expected_key:
+        return None
+    data[key] = value
+    next_step = step + 1
+    save_form_state(user.id, next_step, data, editing_app_id)
+    return next_step
+
+
+async def call_plugin(endpoint: str, nick: str) -> bool:
+    url = f"{PLUGIN_BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     try:
-        url = f"{PLUGIN_BASE_URL.rstrip('/')}/health"
-        resp = requests.get(url, timeout=3)
-        return resp.status_code == 200 and resp.text.strip().lower() == "ok"
-    except Exception:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data={"nick": nick, "secret": PLUGIN_SECRET}, timeout=5) as resp:
+                text = await resp.text()
+                return resp.status == 200 and text.strip().lower() == "ok"
+    except Exception as e:
+        logging.error("Plugin call error: %s", e)
         return False
 
 
-def notify_admins(text: str, keyboard: Optional[types.InlineKeyboardMarkup] = None):
+async def health_check() -> bool:
+    try:
+        url = f"{PLUGIN_BASE_URL.rstrip('/')}/health"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=3) as resp:
+                text = await resp.text()
+                return resp.status == 200 and text.strip().lower() == "ok"
+    except Exception:
+        return False
+
+async def notify_admins(bot: Bot, text: str, keyboard: Optional[InlineKeyboardMarkup] = None):
     for admin_id in ADMIN_IDS:
         try:
-            bot.send_message(admin_id, text, reply_markup=keyboard, parse_mode="Markdown")
+            await bot.send_message(admin_id, text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             pass
 
 
-def send_application_to_admins(app_id: int, answers: dict, user):
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{app_id}"),
-        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{app_id}"),
-        types.InlineKeyboardButton("⛔ Без причины", callback_data=f"reject_noreason:{app_id}"),
+def maybe_alert_admins(bot: Bot, text: str):
+    global LAST_PLUGIN_ALERT_TS
+    now = int(time.time())
+    if now - LAST_PLUGIN_ALERT_TS >= ALERT_COOLDOWN_SECONDS:
+        LAST_PLUGIN_ALERT_TS = now
+        return notify_admins(bot, text)
+    return None
+
+
+async def send_application_to_admins(bot: Bot, app_id: int, answers: dict, user):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                make_button("✅ Одобрить", f"approve:{app_id}", style="positive"),
+                make_button("❌ Отклонить", f"reject:{app_id}", style="negative"),
+                make_button("⛔ Без причины", f"reject_noreason:{app_id}", style="negative"),
+            ],
+            [make_button("📄 Подробнее", f"show:{app_id}")],
+        ]
     )
-    keyboard.add(types.InlineKeyboardButton("📄 Подробнее", callback_data=f"show:{app_id}"))
     username_part = f"@{user.username}" if user.username else "без username"
     text = (
         f"✨ *Новая заявка* `#{app_id}`\n"
@@ -481,35 +556,51 @@ def send_application_to_admins(app_id: int, answers: dict, user):
         f"🎙️ Войс (слушать/говорить): {answers.get('voice_listen', '—')} / {answers.get('voice_speak', '—')}\n"
         f"📎 От: {username_part} (id {user.id})"
     )
-    notify_admins(text, keyboard)
+    await notify_admins(bot, text, keyboard)
 
 
-def process_decision(app_id: int, action: str, admin_chat_id: int):
+async def process_decision(bot: Bot, app_id: int, action: str, admin_chat_id: int):
     app = get_application(app_id)
     if not app:
-        bot.send_message(admin_chat_id, "Заявка не найдена.")
+        await bot.send_message(admin_chat_id, "Заявка не найдена.")
         return
 
-    _id, target_user_id, _username, nick, _q_name, _q_age, _q_mods, _q_voice_listen, _q_voice_speak, _q_device, _q_plans, _q_host, status, _created = app
+    (
+        _id,
+        target_user_id,
+        _username,
+        nick,
+        _q_name,
+        _q_age,
+        _q_mods,
+        _q_voice_listen,
+        _q_voice_speak,
+        _q_device,
+        _q_plans,
+        _q_host,
+        status,
+        _created,
+    ) = app
+
     if status != "pending":
-        bot.send_message(admin_chat_id, f"Заявка уже обработана. Статус: {status}")
+        await bot.send_message(admin_chat_id, f"Заявка уже обработана. Статус: {status}")
         return
 
     if action == "approve":
-        ok = call_plugin("approve", nick)
+        ok = await call_plugin("approve", nick)
         if not ok:
-            bot.send_message(admin_chat_id, "Ошибка плагина. Попробуйте позже.")
-            maybe_alert_admins("⚠️ Плагин недоступен. Проверь порт/хост.")
+            await bot.send_message(admin_chat_id, "Ошибка плагина. Попробуйте позже.")
+            await maybe_alert_admins(bot, "⚠️ Плагин недоступен. Проверь порт/хост.")
             return
 
         set_status(app_id, "approved")
-        bot.send_message(admin_chat_id, f"Заявка #{app_id} одобрена.")
+        await bot.send_message(admin_chat_id, f"Заявка #{app_id} одобрена.")
         try:
-            bot.send_message(
+            await bot.send_message(
                 target_user_id,
                 f"Ваша заявка #{app_id} одобрена. Ник `{nick}` добавлен в вайтлист сервера.\n"
                 f"Чат сервера: {CHAT_INVITE_URL}",
-                parse_mode="Markdown",
+                parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
         except Exception:
@@ -518,11 +609,14 @@ def process_decision(app_id: int, action: str, admin_chat_id: int):
 
     if action == "reject":
         PENDING_REJECT_REASON[admin_chat_id] = app_id
-        reason_kb = types.InlineKeyboardMarkup()
-        for i, r in enumerate(REASON_TEMPLATES, start=1):
-            reason_kb.add(types.InlineKeyboardButton(r, callback_data=f"reason:{app_id}:{i}"))
-        reason_kb.add(types.InlineKeyboardButton("Отклонить без причины", callback_data=f"reject_noreason:{app_id}"))
-        bot.send_message(
+        reason_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [make_button(r, f"reason:{app_id}:{i+1}") for i, r in enumerate(REASON_TEMPLATES[:2])],
+                [make_button(r, f"reason:{app_id}:{i+1}") for i, r in enumerate(REASON_TEMPLATES[2:4], start=2)],
+                [make_button("⛔ Без причины", f"reject_noreason:{app_id}", style="negative")],
+            ]
+        )
+        await bot.send_message(
             admin_chat_id,
             f"Выберите шаблон причины или напишите свой текст для заявки #{app_id}:",
             reply_markup=reason_kb,
@@ -530,10 +624,33 @@ def process_decision(app_id: int, action: str, admin_chat_id: int):
         return
 
 
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    bot.send_message(
-        message.chat.id,
+async def send_next_question(bot: Bot, chat_id: int, step: int):
+    keyboard, text = ask_question(chat_id, step)
+    if keyboard and text:
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
+
+async def finalize_application_for_user(bot: Bot, user, chat_id: int):
+    state = load_form_state(user.id)
+    if not state:
+        return
+
+    _step, answers, editing_app_id = state
+    clear_form_state(user.id)
+
+    if editing_app_id:
+        update_application(editing_app_id, answers)
+        await bot.send_message(chat_id, f"✅ Заявка #{editing_app_id} обновлена.")
+        await notify_admins(bot, f"✏️ Заявка #{editing_app_id} обновлена пользователем.")
+        return
+
+    app_id = create_application(user.id, user.username, answers)
+    await bot.send_message(chat_id, f"✅ Заявка `#{app_id}` отправлена. Ожидай решения администратора.")
+    await send_application_to_admins(bot, app_id, answers, user)
+
+@router.message(F.text == "/start")
+async def cmd_start(message: Message):
+    await message.answer(
         "👋 *Добро пожаловать!*\n"
         "Я — бот заявок на сервер.\n"
         "📜 *Правила бота:*\n"
@@ -544,15 +661,14 @@ def cmd_start(message):
         "Выбери действие ниже или используй команды:\n"
         "`/apply` — подать заявку\n"
         "`/status` — статус заявки",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=build_main_menu(message.from_user.id),
     )
 
 
-@bot.message_handler(commands=["help"])
-def cmd_help(message):
-    bot.send_message(
-        message.chat.id,
+@router.message(F.text == "/help")
+async def cmd_help(message: Message):
+    await message.answer(
         "ℹ️ *Справка*\n"
         "`/apply` — подать заявку\n"
         "`/status` — статус заявки\n"
@@ -563,221 +679,101 @@ def cmd_help(message):
         "`/ban_nick <nick>` — бан по нику (админ)\n"
         "`/unban_nick <nick>` — разбан по нику (админ)\n"
         "`/archive` — архивировать старые заявки (админ)\n",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
-@bot.message_handler(commands=["apply"])
-def cmd_apply(message):
+@router.message(F.text == "/apply")
+async def cmd_apply(message: Message, bot: Bot):
     if message.from_user.id in BAN_USER_IDS:
-        bot.send_message(message.chat.id, "Вы в бан-листе. Заявка недоступна.")
+        await message.answer("Вы в бан-листе. Заявка недоступна.")
         return
 
     last = get_last_application(message.from_user.id)
     if last:
         last_id, _last_nick, last_status, last_created = last
         if last_status == "pending":
-            bot.send_message(
-                message.chat.id,
-                f"У тебя уже есть активная заявка #{last_id}. Дождись решения администратора.",
+            await message.answer(
+                f"У тебя уже есть активная заявка #{last_id}. Дождись решения администратора."
             )
             return
         if not is_admin(message.from_user.id) and int(time.time()) - int(last_created) < COOLDOWN_SECONDS:
             wait_min = max(1, COOLDOWN_SECONDS // 60)
-            bot.send_message(message.chat.id, f"Повторную заявку можно подать через {wait_min} мин.")
+            await message.answer(f"Повторную заявку можно подать через {wait_min} мин.")
             return
 
     state = load_form_state(message.from_user.id)
     if state:
-        bot.send_message(
-            message.chat.id,
-            "У тебя уже есть незавершенная анкета. Ответь на текущий вопрос.",
-        )
+        await message.answer("У тебя уже есть незавершенная анкета. Ответь на текущий вопрос.")
         return
 
     save_form_state(message.from_user.id, 0, {}, None)
-    bot.send_message(
-        message.chat.id,
+    await message.answer(
         "🔥 *Анкета на сервер*\n"
         "Ответь на вопросы по порядку.\n"
         "Отмена: `/cancel`",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    ask_question(message.chat.id, 0)
+    await send_next_question(bot, message.chat.id, 0)
 
 
-@bot.message_handler(commands=["edit"])
-def cmd_edit(message):
+@router.message(F.text == "/edit")
+async def cmd_edit(message: Message, bot: Bot):
     last = get_last_application(message.from_user.id)
     if not last:
-        bot.send_message(message.chat.id, "Нет активной заявки для редактирования.")
+        await message.answer("Нет активной заявки для редактирования.")
         return
     last_id, _last_nick, last_status, _created = last
     if last_status != "pending":
-        bot.send_message(message.chat.id, "Редактировать можно только активную заявку.")
+        await message.answer("Редактировать можно только активную заявку.")
         return
 
     save_form_state(message.from_user.id, 0, {}, last_id)
-    bot.send_message(
-        message.chat.id,
+    await message.answer(
         "✏️ *Редактирование заявки*\n"
         "Ответь на вопросы по порядку.\n"
         "Отмена: `/cancel`",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    ask_question(message.chat.id, 0)
+    await send_next_question(bot, message.chat.id, 0)
 
 
-def ask_question(chat_id: int, index: int):
-    if index >= len(QUESTIONS):
-        return
-        return
-
-    key, title, hint = QUESTIONS[index]
-    keyboard = types.InlineKeyboardMarkup()
-    if key in YES_NO_KEYS:
-        keyboard.add(
-            types.InlineKeyboardButton("✅ Да", callback_data=f"ans:{key}:yes"),
-            types.InlineKeyboardButton("❌ Нет", callback_data=f"ans:{key}:no"),
-        )
-    keyboard.add(types.InlineKeyboardButton("⛔ Отменить", callback_data="cancel_form"))
-    bot.clear_step_handler_by_chat_id(chat_id)
-    sent = bot.send_message(
-        chat_id,
-        f"🧩 *{title}*\n_{hint}_",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
-    bot.register_next_step_handler(sent, handle_answer, index)
-
-
-def handle_answer(message, index: int):
-    state = load_form_state(message.from_user.id)
-    if not state:
-        return
-
-    step, data, editing_app_id = state
-    if index != step:
-        step = index
-
-    text = (message.text or "").strip()
-    key, _title, _hint = QUESTIONS[step]
-
-    if key == "nick" and (len(text) < 3 or len(text) > 16):
-        bot.send_message(message.chat.id, "Ник должен быть 3-16 символов.")
-        ask_question(message.chat.id, step)
-        return
-    if key == "nick" and not MINECRAFT_NICK_RE.match(text):
-        bot.send_message(
-            message.chat.id,
-            "Ник может содержать только латинские буквы, цифры и _ (3-16 символов).",
-        )
-        ask_question(message.chat.id, step)
-        return
-    if key == "nick" and text.lower() in BAN_NICKS:
-        bot.send_message(message.chat.id, "Этот ник в бан-листе.")
-        ask_question(message.chat.id, step)
-        return
-    if key == "age":
-        if not text.isdigit() or not (7 <= int(text) <= 100):
-            bot.send_message(message.chat.id, "Возраст должен быть числом (7-100).")
-            ask_question(message.chat.id, step)
-            return
-
-    if key in YES_NO_KEYS:
-        lower = text.lower()
-        if lower in {"да", "yes", "y"}:
-            save_and_advance(message.from_user, message.chat.id, key, "Да")
-            return
-        if lower in {"нет", "no", "n"}:
-            save_and_advance(message.from_user, message.chat.id, key, "Нет")
-            return
-        bot.send_message(message.chat.id, "Выбери вариант кнопкой ✅ Да / ❌ Нет.")
-        ask_question(message.chat.id, step)
-        return
-
-    if not text:
-        bot.send_message(message.chat.id, "Ответ не может быть пустым.")
-        ask_question(message.chat.id, step)
-        return
-
-    save_and_advance(message.from_user, message.chat.id, key, text)
-
-
-def finalize_application_for_user(user, chat_id: int):
-    state = load_form_state(user.id)
-    if not state:
-        return
-
-    _step, answers, editing_app_id = state
-    clear_form_state(user.id)
-
-    if editing_app_id:
-        update_application(editing_app_id, answers)
-        bot.send_message(chat_id, f"✅ Заявка #{editing_app_id} обновлена.")
-        notify_admins(f"✏️ Заявка #{editing_app_id} обновлена пользователем.")
-        return
-
-    app_id = create_application(user.id, user.username, answers)
-    bot.send_message(chat_id, f"✅ Заявка #{app_id} отправлена. Ожидай решения администратора.")
-    send_application_to_admins(app_id, answers, user)
-
-
-def save_and_advance(user, chat_id: int, key: str, value: str):
-    state = load_form_state(user.id)
-    if not state:
-        return
-    step, data, editing_app_id = state
-    expected_key = QUESTIONS[step][0]
-    if key != expected_key:
-        return
-    data[key] = value
-    next_step = step + 1
-    save_form_state(user.id, next_step, data, editing_app_id)
-    if next_step < len(QUESTIONS):
-        bot.clear_step_handler_by_chat_id(chat_id)
-        ask_question(chat_id, next_step)
-    else:
-        finalize_application_for_user(user, chat_id)
-
-
-@bot.message_handler(commands=["status"])
-def cmd_status(message):
+@router.message(F.text == "/status")
+async def cmd_status(message: Message):
     last = get_last_application(message.from_user.id)
     if not last:
-        bot.send_message(message.chat.id, "У тебя нет заявок.")
+        await message.answer("У тебя нет заявок.")
         return
 
     app_id, nick, status, created_at = last
-    bot.send_message(
-        message.chat.id,
+    await message.answer(
         f"📌 *Последняя заявка* `#{app_id}`\n"
         f"🎮 Ник: `{nick}`\n"
         f"📍 Статус: *{status}*\n"
         f"🕒 Дата: {format_date(created_at)}",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message):
+@router.message(F.text == "/cancel")
+async def cmd_cancel(message: Message):
     state = load_form_state(message.from_user.id)
     if state:
         clear_form_state(message.from_user.id)
-        bot.send_message(message.chat.id, "🗑️ Анкета отменена.")
+        await message.answer("🗑️ Анкета отменена.")
     else:
-        bot.send_message(message.chat.id, "Нет активной анкеты.")
+        await message.answer("Нет активной анкеты.")
 
 
-@bot.message_handler(commands=["pending"])
-def cmd_pending(message, page: int = 1):
+@router.message(F.text == "/pending")
+async def cmd_pending(message: Message, bot: Bot, page: int = 1):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
 
     total = get_pending_count()
     if total == 0:
-        bot.send_message(message.chat.id, "🟢 Активных заявок нет.")
+        await message.answer("🟢 Активных заявок нет.")
         return
 
     page = max(1, page)
@@ -785,7 +781,22 @@ def cmd_pending(message, page: int = 1):
     rows = get_pending_applications(PENDING_PAGE_SIZE, offset)
 
     for row in rows:
-        app_id, user_id, username, nick, q_name, q_age, q_mods, q_voice_listen, q_voice_speak, q_device, q_plans, q_host, _status, _created = row
+        (
+            app_id,
+            user_id,
+            username,
+            nick,
+            q_name,
+            q_age,
+            q_mods,
+            q_voice_listen,
+            q_voice_speak,
+            q_device,
+            q_plans,
+            q_host,
+            _status,
+            _created,
+        ) = row
         username_part = f"@{username}" if username else "без username"
         who = f"{q_name or '—'} / {username_part} / id {user_id}"
         text = (
@@ -801,41 +812,62 @@ def cmd_pending(message, page: int = 1):
             f"💰 Хост: {q_host or '—'}\n"
             f"📎 От: {who}"
         )
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{app_id}"),
-            types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{app_id}"),
-            types.InlineKeyboardButton("⛔ Без причины", callback_data=f"reject_noreason:{app_id}"),
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    make_button("✅ Одобрить", f"approve:{app_id}", style="positive"),
+                    make_button("❌ Отклонить", f"reject:{app_id}", style="negative"),
+                    make_button("⛔ Без причины", f"reject_noreason:{app_id}", style="negative"),
+                ]
+            ]
         )
-        bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=keyboard)
+        await bot.send_message(message.chat.id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
     max_page = (total + PENDING_PAGE_SIZE - 1) // PENDING_PAGE_SIZE
-    nav_keyboard = types.InlineKeyboardMarkup()
+    nav_keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    row = []
     if page > 1:
-        nav_keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"pending_page:{page - 1}"))
+        row.append(make_button("⬅️ Назад", f"pending_page:{page - 1}"))
     if page < max_page:
-        nav_keyboard.add(types.InlineKeyboardButton("➡️ Вперёд", callback_data=f"pending_page:{page + 1}"))
-    bot.send_message(message.chat.id, f"📄 Страница {page}/{max_page}", reply_markup=nav_keyboard)
+        row.append(make_button("➡️ Вперёд", f"pending_page:{page + 1}"))
+    if row:
+        nav_keyboard.inline_keyboard.append(row)
+        await bot.send_message(message.chat.id, f"📄 Страница {page}/{max_page}", reply_markup=nav_keyboard)
 
 
-@bot.message_handler(commands=["show"])
-def cmd_show(message):
+@router.message(F.text == "/show")
+async def cmd_show(message: Message, bot: Bot):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
 
-    parts = message.text.split(maxsplit=1)
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].isdigit():
-        bot.send_message(message.chat.id, "Использование: /show <id>")
+        await message.answer("Использование: /show <id>")
         return
 
     app_id = int(parts[1])
     app = get_application(app_id)
     if not app:
-        bot.send_message(message.chat.id, "Заявка не найдена.")
+        await message.answer("Заявка не найдена.")
         return
 
-    _id, user_id, username, nick, q_name, q_age, q_mods, q_voice_listen, q_voice_speak, q_device, q_plans, q_host, status, created_at = app
+    (
+        _id,
+        user_id,
+        username,
+        nick,
+        q_name,
+        q_age,
+        q_mods,
+        q_voice_listen,
+        q_voice_speak,
+        q_device,
+        q_plans,
+        q_host,
+        status,
+        created_at,
+    ) = app
     username_part = f"@{username}" if username else "без username"
     who = f"{q_name or '—'} / {username_part} / id {user_id}"
     text = (
@@ -855,355 +887,478 @@ def cmd_show(message):
     )
     keyboard = None
     if status == "pending":
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{app_id}"),
-            types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{app_id}"),
-            types.InlineKeyboardButton("⛔ Без причины", callback_data=f"reject_noreason:{app_id}"),
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    make_button("✅ Одобрить", f"approve:{app_id}", style="positive"),
+                    make_button("❌ Отклонить", f"reject:{app_id}", style="negative"),
+                    make_button("⛔ Без причины", f"reject_noreason:{app_id}", style="negative"),
+                ]
+            ]
         )
-    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=keyboard)
+    await bot.send_message(message.chat.id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
-@bot.message_handler(commands=["approve"])
-def cmd_approve(message):
+@router.message(F.text == "/approve")
+async def cmd_approve(message: Message, bot: Bot):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
 
-    parts = message.text.split(maxsplit=1)
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].isdigit():
-        bot.send_message(message.chat.id, "Использование: /approve <id>")
+        await message.answer("Использование: /approve <id>")
         return
 
-    process_decision(int(parts[1]), "approve", message.chat.id)
+    await process_decision(bot, int(parts[1]), "approve", message.chat.id)
 
 
-@bot.message_handler(commands=["reject"])
-def cmd_reject(message):
+@router.message(F.text == "/reject")
+async def cmd_reject(message: Message, bot: Bot):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
 
-    parts = message.text.split(maxsplit=1)
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].isdigit():
-        bot.send_message(message.chat.id, "Использование: /reject <id>")
+        await message.answer("Использование: /reject <id>")
         return
 
-    process_decision(int(parts[1]), "reject", message.chat.id)
+    await process_decision(bot, int(parts[1]), "reject", message.chat.id)
 
 
-@bot.message_handler(commands=["health"])
-def cmd_health(message):
+@router.message(F.text == "/health")
+async def cmd_health(message: Message):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
 
-    ok = health_check()
-    bot.send_message(message.chat.id, "✅ Плагин доступен." if ok else "❌ Плагин недоступен.")
-    if not ok:
-        maybe_alert_admins("⚠️ Плагин недоступен. Проверь порт/хост.")
+    ok = await health_check()
+    await message.answer("✅ Плагин доступен." if ok else "❌ Плагин недоступен.")
 
 
-@bot.message_handler(func=lambda m: m.text == BTN_APPLY)
-def on_btn_apply(message):
-    cmd_apply(message)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_STATUS)
-def on_btn_status(message):
-    cmd_status(message)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_ADMIN)
-def on_btn_admin(message):
+@router.message(F.text == "/stats")
+async def cmd_stats(message: Message):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
-    bot.send_message(message.chat.id, "🛠️ *Админ панель*", parse_mode="Markdown", reply_markup=build_admin_menu())
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_PENDING)
-def on_btn_pending(message):
-    cmd_pending(message, 1)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_SHOW)
-def on_btn_show(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    bot.send_message(message.chat.id, "🔎 Введи ID заявки:")
-    bot.register_next_step_handler(message, handle_show_id)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_SEARCH)
-def on_btn_search(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    bot.send_message(message.chat.id, "Введите поиск (ник, @username или id):")
-    bot.register_next_step_handler(message, handle_search)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_STATS)
-def on_btn_stats(message):
-    cmd_stats(message)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_HEALTH)
-def on_btn_health(message):
-    cmd_health(message)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_HELP)
-def on_btn_help(message):
-    cmd_help(message)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_BACK)
-def on_btn_back(message):
-    bot.send_message(message.chat.id, "🏠 Главное меню:", reply_markup=build_main_menu(message.from_user.id))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_BAN_USER)
-def on_btn_ban_user(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    bot.send_message(message.chat.id, "Введите Telegram ID для бана:")
-    bot.register_next_step_handler(message, handle_ban_user)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_UNBAN_USER)
-def on_btn_unban_user(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    bot.send_message(message.chat.id, "Введите Telegram ID для разбана:")
-    bot.register_next_step_handler(message, handle_unban_user)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_BAN_NICK)
-def on_btn_ban_nick(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    bot.send_message(message.chat.id, "Введите ник для бана:")
-    bot.register_next_step_handler(message, handle_ban_nick)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_UNBAN_NICK)
-def on_btn_unban_nick(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    bot.send_message(message.chat.id, "Введите ник для разбана:")
-    bot.register_next_step_handler(message, handle_unban_nick)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_ARCHIVE)
-def on_btn_archive(message):
-    cmd_archive(message)
-
-
-def handle_show_id(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        bot.send_message(message.chat.id, "Нужен числовой ID заявки.")
-        return
-    app_id = int(text)
-    app = get_application(app_id)
-    if not app:
-        bot.send_message(message.chat.id, "Заявка не найдена.")
-        return
-
-    _id, user_id, username, nick, q_name, q_age, q_mods, q_voice_listen, q_voice_speak, q_device, q_plans, q_host, status, created_at = app
-    username_part = f"@{username}" if username else "без username"
-    who = f"{q_name or '—'} / {username_part} / id {user_id}"
-    text = (
-        f"*Заявка* `#{app_id}`\n"
-        f"🎮 Ник: `{nick}`\n"
-        f"👤 Как обращаться: {q_name or '—'}\n"
-        f"🎂 Возраст: {q_age or '—'}\n"
-        f"🧩 Моды/версии: {q_mods or '—'}\n"
-        f"🎧 Войс (слушать): {q_voice_listen or '—'}\n"
-        f"🎤 Войс (говорить): {q_voice_speak or '—'}\n"
-        f"💻 Устройство: {q_device or '—'}\n"
-        f"🧭 Планы: {q_plans or '—'}\n"
-        f"💰 Хост: {q_host or '—'}\n"
-        f"📎 От: {who}\n"
-        f"📍 Статус: *{status}*\n"
-        f"🕒 Дата: {format_date(created_at)}"
+    s = get_stats()
+    await message.answer(
+        "📊 Статистика:\n"
+        f"Всего: {s['total']}\n"
+        f"Ожидают: {s['pending']}\n"
+        f"Одобрено: {s['approved']}\n"
+        f"Отклонено: {s['rejected']}\n"
+        f"Архив: {s['archived']}",
     )
-    keyboard = None
-    if status == "pending":
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{app_id}"),
-            types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{app_id}"),
-            types.InlineKeyboardButton("⛔ Без причины", callback_data=f"reject_noreason:{app_id}"),
-        )
-    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=keyboard)
 
 
-@bot.message_handler(func=lambda m: m.from_user.id in PENDING_REJECT_REASON)
-def handle_reject_reason(message):
-    admin_id = message.from_user.id
-    app_id = PENDING_REJECT_REASON.pop(admin_id, None)
-    if not app_id:
-        return
-    reason = (message.text or "").strip()
-    if reason == "-" or not reason:
-        reason = None
-
-    app = get_application(app_id)
-    if not app:
-        bot.send_message(admin_id, "Заявка не найдена.")
-        return
-
-    _id, target_user_id, _username, _nick, _q_name, _q_age, _q_mods, _q_voice_listen, _q_voice_speak, _q_device, _q_plans, _q_host, status, _created = app
-    if status != "pending":
-        bot.send_message(admin_id, f"Заявка уже обработана. Статус: {status}")
-        return
-
-    set_status(app_id, "rejected")
-    bot.send_message(admin_id, f"Заявка #{app_id} отклонена.")
-    try:
-        if reason:
-            bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.\nПричина: {reason}")
-        else:
-            bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.")
-    except Exception:
-        pass
-
-
-def handle_search(message):
+@router.message(F.text == "/archive")
+async def cmd_archive(message: Message):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
-    q = (message.text or "").strip()
-    if not q:
-        bot.send_message(message.chat.id, "Пустой запрос.")
-        return
-    rows = search_applications(q, 10)
-    if not rows:
-        bot.send_message(message.chat.id, "Ничего не найдено.")
-        return
-    lines = ["🔎 Результаты поиска (до 10):"]
-    for row in rows:
-        app_id, user_id, username, nick, q_name, q_age, _q_mods, _q_voice_listen, _q_voice_speak, _q_device, _q_plans, _q_host, status, _created = row
-        who = q_name or (f"@{username}" if username else f"id {user_id}")
-        lines.append(f"#{app_id} — {nick} — {who} — {status} — возраст: {q_age or '—'}")
-    bot.send_message(message.chat.id, "\n".join(lines))
+    count = archive_old_applications(ARCHIVE_DAYS)
+    await message.answer(f"Архивировано заявок: {count}")
 
 
-def handle_ban_user(message):
+@router.message(F.text == "/ban_user")
+async def cmd_ban_user(message: Message):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        bot.send_message(message.chat.id, "Нужен числовой Telegram ID.")
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /ban_user <tg_id>")
         return
-    user_id = int(text)
+    user_id = int(parts[1])
     BAN_USER_IDS.add(user_id)
-    bot.send_message(message.chat.id, f"Пользователь {user_id} добавлен в бан-лист.")
+    await message.answer(f"Пользователь {user_id} добавлен в бан-лист.")
 
 
-def handle_unban_user(message):
+@router.message(F.text == "/unban_user")
+async def cmd_unban_user(message: Message):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        bot.send_message(message.chat.id, "Нужен числовой Telegram ID.")
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /unban_user <tg_id>")
         return
-    user_id = int(text)
+    user_id = int(parts[1])
     BAN_USER_IDS.discard(user_id)
-    bot.send_message(message.chat.id, f"Пользователь {user_id} удалён из бан-листа.")
+    await message.answer(f"Пользователь {user_id} удалён из бан-листа.")
 
 
-def handle_ban_nick(message):
+@router.message(F.text == "/ban_nick")
+async def cmd_ban_nick(message: Message):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
-    nick = (message.text or "").strip()
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /ban_nick <nick>")
+        return
+    nick = parts[1].strip()
     if not nick:
-        bot.send_message(message.chat.id, "Ник пустой.")
+        await message.answer("Ник пустой.")
         return
     BAN_NICKS.add(nick.lower())
-    bot.send_message(message.chat.id, f"Ник {nick} добавлен в бан-лист.")
+    await message.answer(f"Ник {nick} добавлен в бан-лист.")
 
 
-def handle_unban_nick(message):
+@router.message(F.text == "/unban_nick")
+async def cmd_unban_nick(message: Message):
     if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
+        await message.answer("Нет прав.")
         return
-    nick = (message.text or "").strip()
-    if not nick:
-        bot.send_message(message.chat.id, "Ник пустой.")
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /unban_nick <nick>")
         return
+    nick = parts[1].strip()
     BAN_NICKS.discard(nick.lower())
-    bot.send_message(message.chat.id, f"Ник {nick} удалён из бан-листа.")
+    await message.answer(f"Ник {nick} удалён из бан-листа.")
+
+@router.message(F.text == BTN_APPLY)
+async def on_btn_apply(message: Message, bot: Bot):
+    await cmd_apply(message, bot)
 
 
-@bot.callback_query_handler(func=lambda call: True)
-def on_callback(call):
+@router.message(F.text == BTN_STATUS)
+async def on_btn_status(message: Message):
+    await cmd_status(message)
+
+
+@router.message(F.text == BTN_ADMIN)
+async def on_btn_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    await message.answer("🛠️ *Админ панель*", parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_menu())
+
+
+@router.message(F.text == BTN_PENDING)
+async def on_btn_pending(message: Message, bot: Bot):
+    await cmd_pending(message, bot, 1)
+
+
+@router.message(F.text == BTN_SHOW)
+async def on_btn_show(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "show"
+    await message.answer("🔎 Введи ID заявки:")
+
+
+@router.message(F.text == BTN_SEARCH)
+async def on_btn_search(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "search"
+    await message.answer("Введите поиск (ник, @username или id):")
+
+
+@router.message(F.text == BTN_STATS)
+async def on_btn_stats(message: Message):
+    await cmd_stats(message)
+
+
+@router.message(F.text == BTN_HEALTH)
+async def on_btn_health(message: Message):
+    await cmd_health(message)
+
+
+@router.message(F.text == BTN_HELP)
+async def on_btn_help(message: Message):
+    await cmd_help(message)
+
+
+@router.message(F.text == BTN_BACK)
+async def on_btn_back(message: Message):
+    await message.answer("🏠 Главное меню:", reply_markup=build_main_menu(message.from_user.id))
+
+
+@router.message(F.text == BTN_BAN_USER)
+async def on_btn_ban_user(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "ban_user"
+    await message.answer("Введите Telegram ID для бана:")
+
+
+@router.message(F.text == BTN_UNBAN_USER)
+async def on_btn_unban_user(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "unban_user"
+    await message.answer("Введите Telegram ID для разбана:")
+
+
+@router.message(F.text == BTN_BAN_NICK)
+async def on_btn_ban_nick(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "ban_nick"
+    await message.answer("Введите ник для бана:")
+
+
+@router.message(F.text == BTN_UNBAN_NICK)
+async def on_btn_unban_nick(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "unban_nick"
+    await message.answer("Введите ник для разбана:")
+
+
+@router.message(F.text == BTN_ARCHIVE)
+async def on_btn_archive(message: Message):
+    await cmd_archive(message)
+
+
+@router.message(F.text)
+async def on_text(message: Message, bot: Bot):
+    if message.text and message.text.startswith("/"):
+        return
+
+    user_id = message.from_user.id
+
+    if user_id in PENDING_REJECT_REASON:
+        app_id = PENDING_REJECT_REASON.pop(user_id, None)
+        if not app_id:
+            return
+        reason = (message.text or "").strip()
+        if reason == "-" or not reason:
+            reason = None
+
+        app = get_application(app_id)
+        if not app:
+            await message.answer("Заявка не найдена.")
+            return
+
+        (
+            _id,
+            target_user_id,
+            _username,
+            _nick,
+            _q_name,
+            _q_age,
+            _q_mods,
+            _q_voice_listen,
+            _q_voice_speak,
+            _q_device,
+            _q_plans,
+            _q_host,
+            status,
+            _created,
+        ) = app
+        if status != "pending":
+            await message.answer(f"Заявка уже обработана. Статус: {status}")
+            return
+
+        set_status(app_id, "rejected")
+        await message.answer(f"Заявка #{app_id} отклонена.")
+        try:
+            if reason:
+                await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.\nПричина: {reason}")
+            else:
+                await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.")
+        except Exception:
+            pass
+        return
+
+    if user_id in PENDING_INPUT_MODE:
+        mode = PENDING_INPUT_MODE.pop(user_id)
+        text = (message.text or "").strip()
+        if mode == "show":
+            if not text.isdigit():
+                await message.answer("Нужен числовой ID заявки.")
+                return
+            await cmd_show(Message.model_validate({**message.model_dump(), "text": f"/show {text}"}), bot)
+            return
+        if mode == "search":
+            rows = search_applications(text, 10)
+            if not rows:
+                await message.answer("Ничего не найдено.")
+                return
+            lines = ["🔎 Результаты поиска (до 10):"]
+            for row in rows:
+                app_id, user_id2, username, nick, q_name, q_age, _q_mods, _q_voice_listen, _q_voice_speak, _q_device, _q_plans, _q_host, status, _created = row
+                who = q_name or (f"@{username}" if username else f"id {user_id2}")
+                lines.append(f"#{app_id} — {nick} — {who} — {status} — возраст: {q_age or '—'}")
+            await message.answer("\n".join(lines))
+            return
+        if mode == "ban_user":
+            if not text.isdigit():
+                await message.answer("Нужен числовой Telegram ID.")
+                return
+            BAN_USER_IDS.add(int(text))
+            await message.answer(f"Пользователь {text} добавлен в бан-лист.")
+            return
+        if mode == "unban_user":
+            if not text.isdigit():
+                await message.answer("Нужен числовой Telegram ID.")
+                return
+            BAN_USER_IDS.discard(int(text))
+            await message.answer(f"Пользователь {text} удалён из бан-листа.")
+            return
+        if mode == "ban_nick":
+            if not text:
+                await message.answer("Ник пустой.")
+                return
+            BAN_NICKS.add(text.lower())
+            await message.answer(f"Ник {text} добавлен в бан-лист.")
+            return
+        if mode == "unban_nick":
+            if not text:
+                await message.answer("Ник пустой.")
+                return
+            BAN_NICKS.discard(text.lower())
+            await message.answer(f"Ник {text} удалён из бан-листа.")
+            return
+
+    state = load_form_state(user_id)
+    if not state:
+        return
+
+    step, _data, _editing_app_id = state
+    key, _title, _hint = QUESTIONS[step]
+    text = (message.text or "").strip()
+
+    if key == "nick" and (len(text) < 3 or len(text) > 16):
+        await message.answer("Ник должен быть 3-16 символов.")
+        await send_next_question(bot, message.chat.id, step)
+        return
+    if key == "nick" and not MINECRAFT_NICK_RE.match(text):
+        await message.answer("Ник может содержать только латинские буквы, цифры и _ (3-16 символов).")
+        await send_next_question(bot, message.chat.id, step)
+        return
+    if key == "nick" and text.lower() in BAN_NICKS:
+        await message.answer("Этот ник в бан-листе.")
+        await send_next_question(bot, message.chat.id, step)
+        return
+    if key == "age":
+        if not text.isdigit() or not (7 <= int(text) <= 100):
+            await message.answer("Возраст должен быть числом (7-100).")
+            await send_next_question(bot, message.chat.id, step)
+            return
+
+    if key in YES_NO_KEYS:
+        lower = text.lower()
+        if lower in {"да", "yes", "y"}:
+            next_step = save_and_advance(message.from_user, key, "Да")
+            if next_step is not None:
+                if next_step < len(QUESTIONS):
+                    await send_next_question(bot, message.chat.id, next_step)
+                else:
+                    await finalize_application_for_user(bot, message.from_user, message.chat.id)
+            return
+        if lower in {"нет", "no", "n"}:
+            next_step = save_and_advance(message.from_user, key, "Нет")
+            if next_step is not None:
+                if next_step < len(QUESTIONS):
+                    await send_next_question(bot, message.chat.id, next_step)
+                else:
+                    await finalize_application_for_user(bot, message.from_user, message.chat.id)
+            return
+        await message.answer("Выбери вариант кнопкой ✅ Да / ❌ Нет.")
+        await send_next_question(bot, message.chat.id, step)
+        return
+
+    if not text:
+        await message.answer("Ответ не может быть пустым.")
+        await send_next_question(bot, message.chat.id, step)
+        return
+
+    next_step = save_and_advance(message.from_user, key, text)
+    if next_step is not None:
+        if next_step < len(QUESTIONS):
+            await send_next_question(bot, message.chat.id, next_step)
+        else:
+            await finalize_application_for_user(bot, message.from_user, message.chat.id)
+
+
+@router.callback_query(F.data)
+async def on_callback(call: CallbackQuery, bot: Bot):
+    data = call.data or ""
     user_id = call.from_user.id
 
-    if call.data == "cancel_form":
+    if data == "cancel_form":
         state = load_form_state(user_id)
         if state:
             clear_form_state(user_id)
-            bot.edit_message_text("🗑️ Анкета отменена.", call.message.chat.id, call.message.message_id)
+            await call.message.edit_text("🗑️ Анкета отменена.")
         else:
-            bot.answer_callback_query(call.id, "Нет активной анкеты.")
+            await call.answer("Нет активной анкеты.")
         return
 
-    if call.data.startswith("pending_page:"):
+    if data.startswith("pending_page:"):
         if not is_admin(user_id):
-            bot.answer_callback_query(call.id, "Нет прав.")
+            await call.answer("Нет прав.")
             return
         try:
-            page = int(call.data.split(":", 1)[1])
+            page = int(data.split(":", 1)[1])
         except Exception:
             page = 1
-        cmd_pending(call.message, page)
-        bot.answer_callback_query(call.id)
+        await cmd_pending(call.message, bot, page)
+        await call.answer()
         return
 
-    if call.data.startswith("ans:"):
-        parts = call.data.split(":")
+    if data.startswith("ans:"):
+        parts = data.split(":")
         if len(parts) != 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.")
+            await call.answer("Некорректные данные.")
             return
         key = parts[1]
         val = parts[2]
         if key not in YES_NO_KEYS:
-            bot.answer_callback_query(call.id, "Некорректный вопрос.")
+            await call.answer("Некорректный вопрос.")
             return
         value = "Да" if val == "yes" else "Нет"
-        save_and_advance(call.from_user, call.message.chat.id, key, value)
-        bot.answer_callback_query(call.id)
+        next_step = save_and_advance(call.from_user, key, value)
+        if next_step is not None:
+            if next_step < len(QUESTIONS):
+                await send_next_question(bot, call.message.chat.id, next_step)
+            else:
+                await finalize_application_for_user(bot, call.from_user, call.message.chat.id)
+        await call.answer()
         return
 
-    if call.data.startswith("show:"):
+    if data.startswith("show:"):
         if not is_admin(user_id):
-            bot.answer_callback_query(call.id, "Нет прав.")
+            await call.answer("Нет прав.")
             return
         try:
-            app_id = int(call.data.split(":", 1)[1])
+            app_id = int(data.split(":", 1)[1])
         except Exception:
-            bot.answer_callback_query(call.id, "Некорректный ID.")
+            await call.answer("Некорректный ID.")
             return
         app = get_application(app_id)
         if not app:
-            bot.answer_callback_query(call.id, "Заявка не найдена.")
+            await call.answer("Заявка не найдена.")
             return
-        _id, user_id2, username, nick, q_name, q_age, q_mods, q_voice_listen, q_voice_speak, q_device, q_plans, q_host, status, created_at = app
+        (
+            _id,
+            user_id2,
+            username,
+            nick,
+            q_name,
+            q_age,
+            q_mods,
+            q_voice_listen,
+            q_voice_speak,
+            q_device,
+            q_plans,
+            q_host,
+            status,
+            created_at,
+        ) = app
         username_part = f"@{username}" if username else "без username"
         who = f"{q_name or '—'} / {username_part} / id {user_id2}"
         text = (
@@ -1223,181 +1378,135 @@ def on_callback(call):
         )
         keyboard = None
         if status == "pending":
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.add(
-                types.InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{app_id}"),
-                types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{app_id}"),
-                types.InlineKeyboardButton("⛔ Без причины", callback_data=f"reject_noreason:{app_id}"),
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        make_button("✅ Одобрить", f"approve:{app_id}", style="positive"),
+                        make_button("❌ Отклонить", f"reject:{app_id}", style="negative"),
+                        make_button("⛔ Без причины", f"reject_noreason:{app_id}", style="negative"),
+                    ]
+                ]
             )
-        bot.send_message(call.message.chat.id, text, parse_mode="Markdown", reply_markup=keyboard)
-        bot.answer_callback_query(call.id)
+        await bot.send_message(call.message.chat.id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await call.answer()
         return
 
-    if call.data.startswith("reject_noreason:"):
+    if data.startswith("reject_noreason:"):
         if not is_admin(user_id):
-            bot.answer_callback_query(call.id, "Нет прав.")
+            await call.answer("Нет прав.")
             return
         try:
-            app_id = int(call.data.split(":", 1)[1])
+            app_id = int(data.split(":", 1)[1])
         except Exception:
-            bot.answer_callback_query(call.id, "Некорректный ID.")
+            await call.answer("Некорректный ID.")
             return
         app = get_application(app_id)
         if not app:
-            bot.answer_callback_query(call.id, "Заявка не найдена.")
+            await call.answer("Заявка не найдена.")
             return
-        _id, target_user_id, _username, _nick, _q_name, _q_age, _q_mods, _q_voice_listen, _q_voice_speak, _q_device, _q_plans, _q_host, status, _created = app
+        (
+            _id,
+            target_user_id,
+            _username,
+            _nick,
+            _q_name,
+            _q_age,
+            _q_mods,
+            _q_voice_listen,
+            _q_voice_speak,
+            _q_device,
+            _q_plans,
+            _q_host,
+            status,
+            _created,
+        ) = app
         if status != "pending":
-            bot.answer_callback_query(call.id, f"Уже обработана: {status}")
+            await call.answer(f"Уже обработана: {status}")
             return
         set_status(app_id, "rejected")
-        bot.edit_message_text(f"Заявка #{app_id} отклонена.", call.message.chat.id, call.message.message_id)
+        await call.message.edit_text(f"Заявка #{app_id} отклонена.")
         try:
-            bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.")
+            await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.")
         except Exception:
             pass
-        bot.answer_callback_query(call.id)
+        await call.answer()
         return
 
-    if call.data.startswith("reason:"):
+    if data.startswith("reason:"):
         if not is_admin(user_id):
-            bot.answer_callback_query(call.id, "Нет прав.")
+            await call.answer("Нет прав.")
             return
-        parts = call.data.split(":")
+        parts = data.split(":")
         if len(parts) != 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.")
+            await call.answer("Некорректные данные.")
             return
         try:
             app_id = int(parts[1])
             idx = int(parts[2]) - 1
         except Exception:
-            bot.answer_callback_query(call.id, "Некорректные данные.")
+            await call.answer("Некорректные данные.")
             return
         if idx < 0 or idx >= len(REASON_TEMPLATES):
-            bot.answer_callback_query(call.id, "Некорректный шаблон.")
+            await call.answer("Некорректный шаблон.")
             return
         reason = REASON_TEMPLATES[idx]
         app = get_application(app_id)
         if not app:
-            bot.answer_callback_query(call.id, "Заявка не найдена.")
+            await call.answer("Заявка не найдена.")
             return
-        _id, target_user_id, _username, _nick, _q_name, _q_age, _q_mods, _q_voice_listen, _q_voice_speak, _q_device, _q_plans, _q_host, status, _created = app
+        (
+            _id,
+            target_user_id,
+            _username,
+            _nick,
+            _q_name,
+            _q_age,
+            _q_mods,
+            _q_voice_listen,
+            _q_voice_speak,
+            _q_device,
+            _q_plans,
+            _q_host,
+            status,
+            _created,
+        ) = app
         if status != "pending":
-            bot.answer_callback_query(call.id, f"Уже обработана: {status}")
+            await call.answer(f"Уже обработана: {status}")
             return
         set_status(app_id, "rejected")
-        bot.edit_message_text(f"Заявка #{app_id} отклонена.", call.message.chat.id, call.message.message_id)
+        await call.message.edit_text(f"Заявка #{app_id} отклонена.")
         try:
-            bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.\nПричина: {reason}")
+            await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.\nПричина: {reason}")
         except Exception:
             pass
-        bot.answer_callback_query(call.id)
+        await call.answer()
         return
 
     if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "Нет прав.")
+        await call.answer("Нет прав.")
         return
 
-    data = call.data or ""
     if ":" not in data:
-        bot.edit_message_text("Некорректные данные.", call.message.chat.id, call.message.message_id)
+        await call.message.edit_text("Некорректные данные.")
         return
 
     action, app_id_str = data.split(":", 1)
     if not app_id_str.isdigit():
-        bot.edit_message_text("Некорректный ID заявки.", call.message.chat.id, call.message.message_id)
+        await call.message.edit_text("Некорректный ID заявки.")
         return
 
     app_id = int(app_id_str)
-    process_decision(app_id, action, call.message.chat.id)
+    await process_decision(bot, app_id, action, call.message.chat.id)
 
 
-@bot.message_handler(commands=["stats"])
-def cmd_stats(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    s = get_stats()
-    bot.send_message(
-        message.chat.id,
-        "📊 Статистика:\n"
-        f"Всего: {s['total']}\n"
-        f"Ожидают: {s['pending']}\n"
-        f"Одобрено: {s['approved']}\n"
-        f"Отклонено: {s['rejected']}\n"
-        f"Архив: {s['archived']}",
-    )
-
-
-@bot.message_handler(commands=["ban_user"])
-def cmd_ban_user(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].isdigit():
-        bot.send_message(message.chat.id, "Использование: /ban_user <tg_id>")
-        return
-    user_id = int(parts[1])
-    BAN_USER_IDS.add(user_id)
-    bot.send_message(message.chat.id, f"Пользователь {user_id} добавлен в бан-лист.")
-
-
-@bot.message_handler(commands=["unban_user"])
-def cmd_unban_user(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].isdigit():
-        bot.send_message(message.chat.id, "Использование: /unban_user <tg_id>")
-        return
-    user_id = int(parts[1])
-    BAN_USER_IDS.discard(user_id)
-    bot.send_message(message.chat.id, f"Пользователь {user_id} удалён из бан-листа.")
-
-
-@bot.message_handler(commands=["ban_nick"])
-def cmd_ban_nick(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.send_message(message.chat.id, "Использование: /ban_nick <nick>")
-        return
-    nick = parts[1].strip()
-    if not nick:
-        bot.send_message(message.chat.id, "Ник пустой.")
-        return
-    BAN_NICKS.add(nick.lower())
-    bot.send_message(message.chat.id, f"Ник {nick} добавлен в бан-лист.")
-
-
-@bot.message_handler(commands=["unban_nick"])
-def cmd_unban_nick(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.send_message(message.chat.id, "Использование: /unban_nick <nick>")
-        return
-    nick = parts[1].strip()
-    BAN_NICKS.discard(nick.lower())
-    bot.send_message(message.chat.id, f"Ник {nick} удалён из бан-листа.")
-
-
-@bot.message_handler(commands=["archive"])
-def cmd_archive(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "Нет прав.")
-        return
-    count = archive_old_applications(ARCHIVE_DAYS)
-    bot.send_message(message.chat.id, f"Архивировано заявок: {count}")
+async def main():
+    db_connect().close()
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    db_connect().close()
-    logging.info("Bot started. DB: %s", DB_PATH)
-    bot.infinity_polling()
+    import asyncio
+    asyncio.run(main())
