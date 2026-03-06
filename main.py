@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
         "Недостаточно информации в анкете",
     ],
     "archive_days": 90,
+    "support_chat": "https://t.me/+15HwEq4ltUJmMTIy",
 }
 
 CONFIG_PATH = "config.json"
@@ -68,6 +69,7 @@ PENDING_PAGE_SIZE = int(DEFAULT_CONFIG["pending_page_size"])
 ALERT_COOLDOWN_SECONDS = int(DEFAULT_CONFIG["alert_cooldown_seconds"])
 REASON_TEMPLATES = list(DEFAULT_CONFIG["reason_templates"])
 ARCHIVE_DAYS = int(DEFAULT_CONFIG["archive_days"])
+SUPPORT_CHAT_URL = DEFAULT_CONFIG["support_chat"]
 ENABLE_BUTTON_STYLE = bool(DEFAULT_CONFIG.get("enable_button_style", False))
 
 # === DB PATH ===
@@ -115,10 +117,15 @@ BTN_UNBAN_NICK = "✅ Разбан ник"
 BTN_ARCHIVE = "📦 Архив"
 BTN_HELP = "ℹ️ Помощь"
 BTN_BACK = "⬅️ Назад"
+BTN_SUPPORT = "🛟 Техподдержка"
+BTN_FEEDBACK = "💬 Отзыв"
+BTN_SUPPORT_DONE = "✅ Отправить"
+BTN_SUPPORT_CANCEL = "❌ Отменить"
 
 LAST_PLUGIN_ALERT_TS = 0
 PENDING_REJECT_REASON: Dict[int, int] = {}
 PENDING_INPUT_MODE: Dict[int, str] = {}
+SELECTED_NICK_BY_USER: Dict[int, str] = {}
 
 
 def db_connect() -> sqlite3.Connection:
@@ -143,6 +150,43 @@ def db_connect() -> sqlite3.Connection:
             q_plans TEXT,
             q_host TEXT,
             status TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            kind TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS support_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            selected_nick TEXT,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS support_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT,
+            file_id TEXT,
+            file_type TEXT,
             created_at INTEGER NOT NULL
         )
         """
@@ -180,6 +224,7 @@ def db_connect() -> sqlite3.Connection:
         """
     )
     ensure_columns(conn)
+    ensure_support_columns(conn)
     return conn
 
 
@@ -203,6 +248,17 @@ def ensure_columns(conn: sqlite3.Connection):
                 conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {col_type}")
             except sqlite3.Error:
                 pass
+
+
+def ensure_support_columns(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(support_sessions)")
+    existing = {row[1] for row in cur.fetchall()}
+    if "selected_nick" not in existing:
+        try:
+            conn.execute("ALTER TABLE support_sessions ADD COLUMN selected_nick TEXT")
+        except sqlite3.Error:
+            pass
 
 def save_form_state(user_id: int, step: int, data: dict, editing_app_id: Optional[int]):
     with db_connect() as conn:
@@ -321,6 +377,38 @@ def get_pending_count() -> int:
         return cur.fetchone()[0]
 
 
+def get_first_approved_nick(user_id: int) -> Optional[str]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT nick FROM applications WHERE user_id = ? AND status = 'approved' ORDER BY id ASC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def get_latest_approved_nick(user_id: int) -> Optional[str]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT nick FROM applications WHERE user_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def get_approved_nicks(user_id: int) -> List[str]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT nick FROM applications WHERE user_id = ? AND status = 'approved' ORDER BY id ASC",
+            (user_id,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
 def get_stats() -> Dict[str, int]:
     with db_connect() as conn:
         cur = conn.cursor()
@@ -364,6 +452,65 @@ def search_applications(query: str, limit: int = 10) -> List[tuple]:
                 "ORDER BY id DESC LIMIT ?",
                 (q, q, q, limit),
             )
+        return cur.fetchall()
+
+
+def start_support_session(user_id: int, username: Optional[str], selected_nick: Optional[str]) -> int:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM support_sessions WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        cur.execute(
+            "INSERT INTO support_sessions (user_id, username, selected_nick, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, selected_nick, "open", int(time.time())),
+        )
+        return cur.lastrowid
+
+
+def get_active_support_session(user_id: int) -> Optional[int]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM support_sessions WHERE user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def get_support_session_selected_nick(session_id: int) -> Optional[str]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT selected_nick FROM support_sessions WHERE id = ?", (session_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def close_support_session(session_id: int):
+    with db_connect() as conn:
+        conn.execute("UPDATE support_sessions SET status = 'closed' WHERE id = ?", (session_id,))
+
+
+def add_support_message(session_id: int, kind: str, text: Optional[str], file_id: Optional[str], file_type: Optional[str]):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO support_messages (session_id, kind, text, file_id, file_type, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, kind, text, file_id, file_type, int(time.time())),
+        )
+
+
+def get_support_messages(session_id: int) -> List[tuple]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT kind, text, file_id, file_type FROM support_messages WHERE session_id = ? ORDER BY id ASC",
+            (session_id,),
+        )
         return cur.fetchall()
 
 
@@ -445,6 +592,7 @@ def format_date(ts: int) -> str:
 def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text=BTN_APPLY), KeyboardButton(text=BTN_STATUS)],
+        [KeyboardButton(text=BTN_SUPPORT), KeyboardButton(text=BTN_FEEDBACK)],
         [KeyboardButton(text=BTN_HELP)],
     ]
     if is_admin(user_id):
@@ -648,6 +796,55 @@ async def finalize_application_for_user(bot: Bot, user, chat_id: int):
     await bot.send_message(chat_id, f"✅ Заявка `#{app_id}` отправлена. Ожидай решения администратора.")
     await send_application_to_admins(bot, app_id, answers, user)
 
+
+async def finalize_support(bot: Bot, message: Message):
+    session_id = get_active_support_session(message.from_user.id)
+    if not session_id:
+        await message.answer("Нет активного обращения.")
+        return
+
+    msgs = get_support_messages(session_id)
+    if not msgs:
+        await message.answer("Вы не отправили ни одного сообщения.")
+        return
+
+    close_support_session(session_id)
+    selected = get_support_session_selected_nick(session_id) or SELECTED_NICK_BY_USER.get(message.from_user.id)
+    approved_nick = selected or get_latest_approved_nick(message.from_user.id) or get_first_approved_nick(message.from_user.id)
+    header = (
+        "🛟 *Обращение в техподдержку*\n"
+        f"От: @{message.from_user.username or 'без username'} (id {message.from_user.id})\n"
+        f"Одобренный ник: {approved_nick or 'нет'}\n"
+        f"ID обращения: `{session_id}`"
+    )
+
+    texts = [m[1] for m in msgs if m[0] == "text" and m[1]]
+    if texts:
+        header += "\n\nСообщения:\n" + "\n".join([f"- {t}" for t in texts])
+
+    await notify_admins(bot, header)
+
+    # отправляем файлы отдельно (Telegram не позволяет объединить всё в одно сообщение)
+    for admin_id in ADMIN_IDS:
+        for _kind, _text, file_id, file_type in msgs:
+            if not file_id:
+                continue
+            try:
+                if file_type == "photo":
+                    await bot.send_photo(admin_id, file_id)
+                elif file_type == "document":
+                    await bot.send_document(admin_id, file_id)
+                elif file_type == "video":
+                    await bot.send_video(admin_id, file_id)
+                elif file_type == "audio":
+                    await bot.send_audio(admin_id, file_id)
+                elif file_type == "voice":
+                    await bot.send_voice(admin_id, file_id)
+            except Exception:
+                pass
+
+    await message.answer("✅ Обращение отправлено.", reply_markup=build_main_menu(message.from_user.id))
+
 @router.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
@@ -674,6 +871,10 @@ async def cmd_help(message: Message):
         "`/status` — статус заявки\n"
         "`/cancel` — отменить анкету\n"
         "`/edit` — редактировать активную заявку\n"
+        "`/support` — техподдержка\n"
+        "`/feedback` — оставить отзыв\n"
+        "`/support_done` — отправить обращение (техподдержка)\n"
+        "`/support_cancel` — отменить обращение (техподдержка)\n"
         "`/ban_user <tg_id>` — бан по Telegram ID (админ)\n"
         "`/unban_user <tg_id>` — разбан по Telegram ID (админ)\n"
         "`/ban_nick <nick>` — бан по нику (админ)\n"
@@ -753,6 +954,78 @@ async def cmd_status(message: Message):
         f"🕒 Дата: {format_date(created_at)}",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+@router.message(F.text == "/support")
+async def cmd_support(message: Message):
+    approved_nicks = get_approved_nicks(message.from_user.id)
+    if len(approved_nicks) > 1:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [make_button(f"🎮 {n}", f"picknick:support:{n}") for n in approved_nicks[i:i+2]]
+                for i in range(0, len(approved_nicks), 2)
+            ]
+        )
+        await message.answer(
+            "Выбери ник, с которым обращаешься в поддержку:",
+            reply_markup=keyboard,
+        )
+        return
+    selected_nick = approved_nicks[0] if approved_nicks else None
+    SELECTED_NICK_BY_USER[message.from_user.id] = selected_nick or ""
+    session_id = start_support_session(message.from_user.id, message.from_user.username, selected_nick)
+    text = (
+        "🛟 *Техподдержка*\n"
+        "Опиши проблему и можешь прикрепить файлы/фото.\n"
+        "Когда закончишь — нажми «Отправить».\n"
+        f"Также можно написать в чат: {SUPPORT_CHAT_URL}\n"
+        f"ID обращения: `{session_id}`"
+    )
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_SUPPORT_DONE), KeyboardButton(text=BTN_SUPPORT_CANCEL)]],
+        resize_keyboard=True,
+    )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+@router.message(F.text == "/feedback")
+async def cmd_feedback(message: Message):
+    approved_nicks = get_approved_nicks(message.from_user.id)
+    if len(approved_nicks) > 1:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [make_button(f"🎮 {n}", f"picknick:feedback:{n}") for n in approved_nicks[i:i+2]]
+                for i in range(0, len(approved_nicks), 2)
+            ]
+        )
+        await message.answer(
+            "Выбери ник, с которым оставляешь отзыв:",
+            reply_markup=keyboard,
+        )
+        return
+    selected_nick = approved_nicks[0] if approved_nicks else None
+    SELECTED_NICK_BY_USER[message.from_user.id] = selected_nick or ""
+    text = (
+        "💬 *Отзыв*\n"
+        "Напиши короткий отзыв: что понравилось, что улучшить."
+    )
+    PENDING_INPUT_MODE[message.from_user.id] = "feedback"
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(F.text == "/support_done")
+async def cmd_support_done(message: Message, bot: Bot):
+    await finalize_support(bot, message)
+
+
+@router.message(F.text == "/support_cancel")
+async def cmd_support_cancel(message: Message):
+    session_id = get_active_support_session(message.from_user.id)
+    if not session_id:
+        await message.answer("Нет активного обращения.")
+        return
+    close_support_session(session_id)
+    await message.answer("Обращение отменено.", reply_markup=build_main_menu(message.from_user.id))
 
 
 @router.message(F.text == "/cancel")
@@ -1081,6 +1354,31 @@ async def on_btn_back(message: Message):
     await message.answer("🏠 Главное меню:", reply_markup=build_main_menu(message.from_user.id))
 
 
+@router.message(F.text == BTN_SUPPORT)
+async def on_btn_support(message: Message):
+    await cmd_support(message)
+
+
+@router.message(F.text == BTN_FEEDBACK)
+async def on_btn_feedback(message: Message):
+    await cmd_feedback(message)
+
+
+@router.message(F.text == BTN_SUPPORT_DONE)
+async def on_btn_support_done(message: Message, bot: Bot):
+    await finalize_support(bot, message)
+
+
+@router.message(F.text == BTN_SUPPORT_CANCEL)
+async def on_btn_support_cancel(message: Message):
+    session_id = get_active_support_session(message.from_user.id)
+    if not session_id:
+        await message.answer("Нет активного обращения.")
+        return
+    close_support_session(session_id)
+    await message.answer("Обращение отменено.", reply_markup=build_main_menu(message.from_user.id))
+
+
 @router.message(F.text == BTN_BAN_USER)
 async def on_btn_ban_user(message: Message):
     if not is_admin(message.from_user.id):
@@ -1173,9 +1471,44 @@ async def on_text(message: Message, bot: Bot):
             pass
         return
 
+    session_id = get_active_support_session(user_id)
+    if session_id:
+        text = (message.text or "").strip()
+        if text:
+            add_support_message(session_id, "text", text, None, None)
+            await message.answer("Сообщение добавлено. Можешь отправить ещё или нажать «Отправить».")
+        return
+
     if user_id in PENDING_INPUT_MODE:
         mode = PENDING_INPUT_MODE.pop(user_id)
         text = (message.text or "").strip()
+        if mode == "feedback":
+            if not text:
+                await message.answer("Сообщение пустое. Попробуй ещё раз.")
+                return
+            kind = "feedback"
+            with db_connect() as conn:
+                conn.execute(
+                    "INSERT INTO feedback (user_id, username, kind, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        user_id,
+                        message.from_user.username,
+                        kind,
+                        text,
+                        int(time.time()),
+                    ),
+                )
+            await message.answer("✅ Спасибо! Отзыв отправлен.")
+            selected = SELECTED_NICK_BY_USER.get(user_id)
+            approved = selected or get_latest_approved_nick(user_id) or get_first_approved_nick(user_id)
+            await notify_admins(
+                bot,
+                f"💬 Отзыв\n"
+                f"От: @{message.from_user.username or 'без username'} (id {user_id})\n"
+                f"Одобренный ник: {approved or 'нет'}\n"
+                f"Сообщение: {text}",
+            )
+            return
         if mode == "show":
             if not text.isdigit():
                 await message.answer("Нужен числовой ID заявки.")
@@ -1284,6 +1617,25 @@ async def on_text(message: Message, bot: Bot):
             await finalize_application_for_user(bot, message.from_user, message.chat.id)
 
 
+@router.message(F.photo | F.document | F.video | F.audio | F.voice)
+async def on_support_media(message: Message):
+    session_id = get_active_support_session(message.from_user.id)
+    if not session_id:
+        return
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        add_support_message(session_id, "media", None, file_id, "photo")
+    elif message.document:
+        add_support_message(session_id, "media", None, message.document.file_id, "document")
+    elif message.video:
+        add_support_message(session_id, "media", None, message.video.file_id, "video")
+    elif message.audio:
+        add_support_message(session_id, "media", None, message.audio.file_id, "audio")
+    elif message.voice:
+        add_support_message(session_id, "media", None, message.voice.file_id, "voice")
+    await message.answer("Файл добавлен. Можешь отправить ещё или нажать «Отправить».")
+
+
 @router.callback_query(F.data)
 async def on_callback(call: CallbackQuery, bot: Bot):
     data = call.data or ""
@@ -1327,6 +1679,38 @@ async def on_callback(call: CallbackQuery, bot: Bot):
                 await send_next_question(bot, call.message.chat.id, next_step)
             else:
                 await finalize_application_for_user(bot, call.from_user, call.message.chat.id)
+        await call.answer()
+        return
+
+    if data.startswith("picknick:"):
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await call.answer("Некорректные данные.")
+            return
+        mode = parts[1]
+        nick = parts[2]
+        SELECTED_NICK_BY_USER[user_id] = nick
+        if mode == "support":
+            session_id = start_support_session(call.from_user.id, call.from_user.username, nick)
+            text = (
+                "🛟 *Техподдержка*\n"
+                "Опиши проблему и можешь прикрепить файлы/фото.\n"
+                "Когда закончишь — нажми «Отправить».\n"
+                f"Также можно написать в чат: {SUPPORT_CHAT_URL}\n"
+                f"ID обращения: `{session_id}`"
+            )
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text=BTN_SUPPORT_DONE), KeyboardButton(text=BTN_SUPPORT_CANCEL)]],
+                resize_keyboard=True,
+            )
+            await bot.send_message(call.message.chat.id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard, disable_web_page_preview=True)
+        elif mode == "feedback":
+            PENDING_INPUT_MODE[user_id] = "feedback"
+            text = (
+                "💬 *Отзыв*\n"
+                "Напиши короткий отзыв: что понравилось, что улучшить."
+            )
+            await bot.send_message(call.message.chat.id, text, parse_mode=ParseMode.MARKDOWN)
         await call.answer()
         return
 
