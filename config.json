@@ -1,0 +1,18 @@
+{
+  "admin_ids": [1322362053, 1875115860],
+  "plugin_base_url": "http://c7.play2go.cloud:20795",
+  "plugin_secret": "RrN4Jt9Vq2KpX8mZ",
+  "chat_invite_url": "https://t.me/+15HwEq4ltUJmMTIy",
+  "cooldown_seconds": 600,
+  "pending_page_size": 5,
+  "banned_user_ids": [],
+  "banned_nicks": [],
+  "alert_cooldown_seconds": 300,
+  "reason_templates": [
+    "Не подходит по возрасту",
+    "Нет микрофона / не готов к войсчату",
+    "Нет возможности играть на новых версиях",
+    "Недостаточно информации в анкете"
+  ],
+  "archive_days": 90
+}
