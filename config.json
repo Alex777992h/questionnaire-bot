@@ -15,6 +15,12 @@
     "Недостаточно информации в анкете"
   ],
   "archive_days": 90,
+  "rate_limit_seconds": 2,
+  "support_auto_close_hours": 12,
+  "cleanup_interval_minutes": 60,
+  "support_retention_days": 60,
+  "form_state_retention_days": 2,
+  "tickets_page_size": 5,
   "enable_button_style": false,
   "support_chat": "https://t.me/+15HwEq4ltUJmMTIy"
 }
