@@ -13,6 +13,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import (
     Message,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -53,6 +54,8 @@ DEFAULT_CONFIG = {
     "support_retention_days": 60,
     "form_state_retention_days": 2,
     "tickets_page_size": 5,
+    "bot_username": "infinitycraftmembers_bot",
+    "group_chat_ids": [],
 }
 
 CONFIG_PATH = "config.json"
@@ -83,6 +86,9 @@ CLEANUP_INTERVAL_SECONDS = int(DEFAULT_CONFIG.get("cleanup_interval_minutes", 60
 SUPPORT_RETENTION_DAYS = int(DEFAULT_CONFIG.get("support_retention_days", 60))
 FORM_STATE_RETENTION_DAYS = int(DEFAULT_CONFIG.get("form_state_retention_days", 2))
 TICKETS_PAGE_SIZE = int(DEFAULT_CONFIG.get("tickets_page_size", 5))
+BOT_USERNAME = DEFAULT_CONFIG.get("bot_username", "").lstrip("@")
+APPLY_DEEPLINK = f"https://t.me/{BOT_USERNAME}?start=apply" if BOT_USERNAME else ""
+GROUP_CHAT_IDS = set(DEFAULT_CONFIG.get("group_chat_ids", []))
 
 # === DB PATH ===
 if os.path.exists("/app/data/"):
@@ -117,6 +123,7 @@ YES_NO_KEYS = {"mods", "voice_listen", "voice_speak", "host"}
 BTN_APPLY = "📝 Подать заявку"
 BTN_STATUS = "📌 Статус заявки"
 BTN_ADMIN = "🛠️ Админ панель"
+BTN_ACCOUNTS = "👥 Аккаунты"
 BTN_PENDING = "🧾 Активные заявки"
 BTN_SHOW = "🔎 Показать по ID"
 BTN_SEARCH = "🔍 Поиск"
@@ -134,6 +141,7 @@ BTN_FEEDBACK = "💬 Отзыв"
 BTN_SUPPORT_DONE = "✅ Отправить"
 BTN_SUPPORT_CANCEL = "❌ Отменить"
 BTN_CANCEL = "❌ Отменить"
+BTN_SKIP = "⏭️ Пропустить"
 
 TICKET_TOPICS = [
     ("server", "🌍 Проблемы на сервере"),
@@ -143,12 +151,28 @@ TICKET_TOPICS = [
     ("bot", "🤖 Проблема с ботом"),
 ]
 
+BRAND = "INFINITY CRAFT"
+ACCENT_LINE = "━━━━━━━━━━━━━━━━━━"
+
+
+def fmt_header(title: str) -> str:
+    return f"✨ *{title}*\n{ACCENT_LINE}"
+
+
+def fmt_section(title: str, body: str) -> str:
+    return f"\n*{title}*\n{body}"
+
+
+def fmt_kv(label: str, value: str) -> str:
+    return f"{label}: {value}"
+
 LAST_PLUGIN_ALERT_TS = 0
 LAST_CLEANUP_TS = 0
 PENDING_REJECT_REASON: Dict[int, int] = {}
 PENDING_INPUT_MODE: Dict[int, str] = {}
 SELECTED_NICK_BY_USER: Dict[int, str] = {}
 TICKET_DRAFT_BY_USER: Dict[int, Dict[str, str]] = {}
+FEEDBACK_DRAFT_BY_USER: Dict[int, Dict[str, str]] = {}
 LAST_ACTION_TS: Dict[tuple, float] = {}
 
 
@@ -185,7 +209,30 @@ def db_connect() -> sqlite3.Connection:
             user_id INTEGER NOT NULL,
             username TEXT,
             kind TEXT NOT NULL,
+            target TEXT,
+            rating INTEGER,
             message TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nick TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nick TEXT NOT NULL,
+            action TEXT NOT NULL,
             created_at INTEGER NOT NULL
         )
         """
@@ -276,6 +323,22 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+def save_config_group_ids():
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        else:
+            cfg = {}
+        cfg["group_chat_ids"] = sorted(GROUP_CHAT_IDS)
+        if BOT_USERNAME:
+            cfg["bot_username"] = BOT_USERNAME
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def ensure_columns(conn: sqlite3.Connection):
     columns = {
         "q_name": "TEXT",
@@ -296,6 +359,20 @@ def ensure_columns(conn: sqlite3.Connection):
                 conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {col_type}")
             except sqlite3.Error:
                 pass
+    cur.execute("PRAGMA table_info(feedback)")
+    fb_existing = {row[1] for row in cur.fetchall()}
+    if "target" not in fb_existing:
+        try:
+            conn.execute("ALTER TABLE feedback ADD COLUMN target TEXT")
+        except sqlite3.Error:
+            pass
+    if "rating" not in fb_existing:
+        try:
+            conn.execute("ALTER TABLE feedback ADD COLUMN rating INTEGER")
+        except sqlite3.Error:
+            pass
+    cur.execute("PRAGMA table_info(user_accounts)")
+    _ = cur.fetchall()
 
 
 def ensure_support_columns(conn: sqlite3.Connection):
@@ -441,35 +518,96 @@ def get_pending_count() -> int:
 
 
 def get_first_approved_nick(user_id: int) -> Optional[str]:
-    with db_connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT nick FROM applications WHERE user_id = ? AND status = 'approved' ORDER BY id ASC LIMIT 1",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
+    nicks = get_user_accounts(user_id)
+    return nicks[0] if nicks else None
 
 
 def get_latest_approved_nick(user_id: int) -> Optional[str]:
-    with db_connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT nick FROM applications WHERE user_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
+    nicks = get_user_accounts(user_id)
+    return nicks[-1] if nicks else None
 
 
 def get_approved_nicks(user_id: int) -> List[str]:
+    return get_user_accounts(user_id)
+
+
+def _bootstrap_accounts_from_applications(user_id: int):
     with db_connect() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT nick FROM applications WHERE user_id = ? AND status = 'approved' ORDER BY id ASC",
             (user_id,),
         )
-        return [row[0] for row in cur.fetchall()]
+        rows = [r[0] for r in cur.fetchall()]
+        for nick in rows:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO user_accounts (user_id, nick, created_at) VALUES (?, ?, ?)",
+                    (user_id, nick, int(time.time())),
+                )
+            except sqlite3.Error:
+                pass
+
+
+def get_user_accounts(user_id: int) -> List[str]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT nick FROM user_accounts WHERE user_id = ? ORDER BY id ASC",
+            (user_id,),
+        )
+        rows = [row[0] for row in cur.fetchall()]
+    if not rows:
+        _bootstrap_accounts_from_applications(user_id)
+        with db_connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT nick FROM user_accounts WHERE user_id = ? ORDER BY id ASC",
+                (user_id,),
+            )
+            rows = [row[0] for row in cur.fetchall()]
+    return rows
+
+
+def count_user_accounts(user_id: int) -> int:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM user_accounts WHERE user_id = ?", (user_id,))
+        return cur.fetchone()[0]
+
+
+def account_exists(nick: str) -> bool:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM user_accounts WHERE lower(nick) = lower(?) LIMIT 1", (nick,))
+        return cur.fetchone() is not None
+
+
+def add_user_account(user_id: int, nick: str) -> bool:
+    with db_connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO user_accounts (user_id, nick, created_at) VALUES (?, ?, ?)",
+                (user_id, nick, int(time.time())),
+            )
+            return True
+        except sqlite3.Error:
+            return False
+
+
+def remove_user_account(user_id: int, nick: str) -> bool:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM user_accounts WHERE user_id = ? AND lower(nick) = lower(?)", (user_id, nick))
+        return cur.rowcount > 0
+
+
+def log_account_action(user_id: int, nick: str, action: str):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO account_log (user_id, nick, action, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, nick, action, int(time.time())),
+        )
 
 
 def get_user_selected_nick(user_id: int) -> Optional[str]:
@@ -553,12 +691,16 @@ def get_stats() -> Dict[str, int]:
         rejected = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM applications_archive")
         archived = cur.fetchone()[0]
+        cur.execute("SELECT AVG(rating) FROM feedback WHERE kind = 'bot_rating'")
+        avg_rating_row = cur.fetchone()
+        avg_rating = float(avg_rating_row[0]) if avg_rating_row and avg_rating_row[0] is not None else 0.0
     return {
         "total": total,
         "pending": pending,
         "approved": approved,
         "rejected": rejected,
         "archived": archived,
+        "avg_rating": avg_rating,
     }
 
 
@@ -696,6 +838,30 @@ def list_user_tickets(user_id: int, limit: int, offset: int) -> List[tuple]:
         return cur.fetchall()
 
 
+def search_tickets(query: str, limit: int = 10) -> List[tuple]:
+    q_raw = (query or "").strip()
+    if q_raw.startswith("@"):
+        q_raw = q_raw[1:]
+    q = f"%{q_raw}%"
+    with db_connect() as conn:
+        cur = conn.cursor()
+        if q_raw.isdigit():
+            cur.execute(
+                "SELECT id, user_id, username, topic, subject, status, created_at, updated_at "
+                "FROM support_sessions WHERE id = ? OR user_id = ? OR username LIKE ? OR subject LIKE ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (int(q_raw), int(q_raw), q, q, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT id, user_id, username, topic, subject, status, created_at, updated_at "
+                "FROM support_sessions WHERE username LIKE ? OR subject LIKE ? OR topic LIKE ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (q, q, q, limit),
+            )
+        return cur.fetchall()
+
+
 def get_ticket_count(status: Optional[str] = None) -> int:
     with db_connect() as conn:
         cur = conn.cursor()
@@ -722,6 +888,28 @@ def get_last_ticket_message_kind(ticket_id: int) -> Optional[str]:
         )
         row = cur.fetchone()
         return row[0] if row else None
+
+
+def has_bot_rating(user_id: int, app_id: int) -> bool:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM feedback WHERE kind = 'bot_rating' AND target = 'bot' AND message = ? AND user_id = ? LIMIT 1",
+            (str(app_id), user_id),
+        )
+        return cur.fetchone() is not None
+
+
+def build_accounts_panel(nicks: List[str], primary: Optional[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for n in nicks:
+        row = [make_button(f"❌ Удалить {n}", f"acc_del:{n}")]
+        if primary and n != primary:
+            row.append(make_button("⭐ Сделать основным", f"acc_primary:{n}"))
+        rows.append(row)
+    if len(nicks) < 2:
+        rows.append([make_button("➕ Добавить ник", "acc_add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def archive_old_applications(days: int) -> int:
@@ -802,9 +990,12 @@ def format_date(ts: int) -> str:
 def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text=BTN_APPLY), KeyboardButton(text=BTN_STATUS)],
+        [KeyboardButton(text=BTN_ACCOUNTS)],
         [KeyboardButton(text=BTN_SUPPORT), KeyboardButton(text=BTN_FEEDBACK)],
         [KeyboardButton(text=BTN_HELP)],
     ]
+    if is_admin(user_id):
+        keyboard.append([KeyboardButton(text=BTN_ADMIN)])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
@@ -820,6 +1011,10 @@ def build_admin_panel() -> InlineKeyboardMarkup:
         ],
         [
             make_button("📮 Тикеты", "admin:tickets"),
+            make_button("🔎 Тикеты", "admin:ticket_search"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ Добавить в группу", url=f"https://t.me/{BOT_USERNAME}?startgroup=true"),
         ],
         [
             make_button("🩺 Плагин", "admin:health"),
@@ -926,13 +1121,16 @@ async def send_application_to_admins(bot: Bot, app_id: int, answers: dict, user)
         ]
     )
     username_part = f"@{user.username}" if user.username else "без username"
+    nick_val = answers.get("nick", "")
+    voice_val = f"{answers.get('voice_listen', '—')} / {answers.get('voice_speak', '—')}"
     text = (
-        f"✨ *Новая заявка* `#{app_id}`\n"
-        f"🎮 Ник: `{answers.get('nick', '')}`\n"
-        f"👤 Как обращаться: {answers.get('name', '')}\n"
-        f"🎂 Возраст: {answers.get('age', '')}\n"
-        f"🎙️ Войс (слушать/говорить): {answers.get('voice_listen', '—')} / {answers.get('voice_speak', '—')}\n"
-        f"📎 От: {username_part} (id {user.id})"
+        f"{fmt_header('Новая заявка')}\n"
+        f"{fmt_kv('ID', f'`#{app_id}`')}\n"
+        f"{fmt_kv('Ник', f'`{nick_val}`')}\n"
+        f"{fmt_kv('Как обращаться', answers.get('name', '—'))}\n"
+        f"{fmt_kv('Возраст', answers.get('age', '—'))}\n"
+        f"{fmt_kv('Войс (слушать/говорить)', voice_val)}\n"
+        f"{fmt_kv('От', f'{username_part} (id {user.id})')}"
     )
     await notify_admins(bot, text, keyboard)
 
@@ -948,8 +1146,8 @@ async def process_decision(bot: Bot, app_id: int, action: str, admin_chat_id: in
         target_user_id,
         _username,
         nick,
-        _q_name,
-        _q_age,
+        q_name,
+        q_age,
         _q_mods,
         _q_voice_listen,
         _q_voice_speak,
@@ -974,19 +1172,52 @@ async def process_decision(bot: Bot, app_id: int, action: str, admin_chat_id: in
         set_status(app_id, "approved")
         if not get_user_selected_nick(target_user_id):
             set_user_selected_nick(target_user_id, nick)
+        add_user_account(target_user_id, nick)
         log_decision(app_id, admin_chat_id, admin_username, "approve", None)
         await bot.send_message(admin_chat_id, f"Заявка #{app_id} одобрена.")
         try:
             await bot.send_message(
                 target_user_id,
-                f"Ваша заявка #{app_id} одобрена. Ник `{nick}` добавлен в вайтлист сервера.\n"
-                f"Чат сервера: {CHAT_INVITE_URL}\n"
-                "IP сервера: `infinity-craft.ru`",
+                f"{fmt_header('Заявка одобрена')}\n"
+                f"{fmt_kv('ID', f'`#{app_id}`')}\n"
+                f"{fmt_kv('Ник', f'`{nick}`')}\n"
+                f"{fmt_kv('Чат', CHAT_INVITE_URL)}\n"
+                f"{fmt_kv('IP', '`infinity-craft.ru`')}",
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
+            if not has_bot_rating(target_user_id, app_id):
+                rate_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        make_button("⭐1", f"rate:{app_id}:1"),
+                        make_button("⭐2", f"rate:{app_id}:2"),
+                        make_button("⭐3", f"rate:{app_id}:3"),
+                        make_button("⭐4", f"rate:{app_id}:4"),
+                        make_button("⭐5", f"rate:{app_id}:5"),
+                        make_button("⏭️ Пропустить", f"rate:{app_id}:skip"),
+                    ]]
+                )
+                await bot.send_message(
+                    target_user_id,
+                    "Оцени работу бота (1–5):",
+                    reply_markup=rate_kb,
+                )
         except Exception:
             pass
+        if GROUP_CHAT_IDS:
+            username_part = f"@{_username}" if _username else "без username"
+            group_text = (
+                f"{fmt_header('Новый игрок')}\n"
+                f"{fmt_kv('Ник', f'`{nick}`')}\n"
+                f"{fmt_kv('Как обращаться', q_name or '—')}\n"
+                f"{fmt_kv('Возраст', q_age or '—')}\n"
+                f"{fmt_kv('Участник', username_part)}"
+            )
+            for gid in GROUP_CHAT_IDS:
+                try:
+                    await bot.send_message(gid, group_text, parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    pass
         return
 
     if action == "reject":
@@ -1022,12 +1253,12 @@ async def finalize_application_for_user(bot: Bot, user, chat_id: int):
 
     if editing_app_id:
         update_application(editing_app_id, answers)
-        await bot.send_message(chat_id, f"✅ Заявка #{editing_app_id} обновлена.")
-        await notify_admins(bot, f"✏️ Заявка #{editing_app_id} обновлена пользователем.")
+        await bot.send_message(chat_id, f"{fmt_header('Заявка обновлена')}\nID: `#{editing_app_id}`", parse_mode=ParseMode.MARKDOWN)
+        await notify_admins(bot, f"{fmt_header('Заявка обновлена')}\nID: `#{editing_app_id}`")
         return
 
     app_id = create_application(user.id, user.username, answers)
-    await bot.send_message(chat_id, f"✅ Заявка `#{app_id}` отправлена. Ожидай решения администратора.")
+    await bot.send_message(chat_id, f"{fmt_header('Заявка отправлена')}\nID: `#{app_id}`\nОжидай решения администрации.", parse_mode=ParseMode.MARKDOWN)
     await send_application_to_admins(bot, app_id, answers, user)
 
 
@@ -1083,8 +1314,9 @@ async def send_ticket_view(bot: Bot, chat_id: int, ticket_id: int, for_admin: bo
     topic_label = next((label for key, label in TICKET_TOPICS if key == topic), topic or "—")
     wait_label = ticket_wait_label(ticket_id, status)
     lines = [
-        f"🎫 *Тикет* `#{ticket_id}`",
-        f"🏷️ Тема: {topic_label}",
+        f"🎫 *Тикет {BRAND}* `#{ticket_id}`",
+        f"{ACCENT_LINE}",
+        f"🏷️ Категория: {topic_label}",
         f"📝 Тема: {subject or '—'}",
         f"📌 Статус: {ticket_status_label(status)}",
         f"⏳ Ожидание: {wait_label}",
@@ -1119,7 +1351,7 @@ async def send_ticket_list(bot: Bot, chat_id: int, page: int, for_admin: bool, u
     if not rows:
         await bot.send_message(chat_id, "Тикетов пока нет.")
         return
-    lines = [f"📮 *Тикеты* (страница {page})"]
+    lines = [f"📮 *Тикеты {BRAND}* (страница {page})", ACCENT_LINE]
     buttons = []
     for tid, uid, username, topic, subject, status, created_at, updated_at in rows:
         subject_short = (subject or "Без темы")[:24]
@@ -1137,22 +1369,23 @@ async def send_ticket_list(bot: Bot, chat_id: int, page: int, for_admin: bool, u
         buttons.append(nav)
     await bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-@router.message(F.text == "/start")
+@router.message(F.text.startswith("/start"))
 async def cmd_start(message: Message):
+    args = (message.text or "").split(maxsplit=1)
+    payload = args[1].strip() if len(args) > 1 else ""
+    if payload == "apply":
+        await cmd_apply(message, message.bot)
+        return
     text = (
-        "👋 *Добро пожаловать!*\n"
-        "Я — бот заявок на сервер.\n"
-        "📜 *Правила бота:*\n"
-        "1. Заполняй анкету честно и по делу.\n"
-        "2. Не флуди и не подавай дубликаты — есть ограничение по времени.\n"
-        "3. Нельзя использовать оскорбления и мат в ответах.\n"
-        "4. Ник — только латиница, цифры и `_` (3–16 символов).\n\n"
-        "Выбери действие ниже или используй команды:\n"
-        "`/apply` — подать заявку\n"
-        "`/status` — статус заявки"
+        f"{fmt_header(BRAND)}\n"
+        "👋 Привет! Я помогу подать заявку и следить за её статусом.\n"
+        f"{fmt_section('Правила бота', '• Пиши честно и по делу\\n• Не флуди и не отправляй дубликаты\\n• Без оскорблений и мата\\n• Ник: латиница, цифры и `_` (3–16)')}\n"
+        f"{fmt_section('Быстрые команды', '`/apply` — подать заявку\\n`/status` — статус заявки')}"
     )
     if is_admin(message.from_user.id):
         text += "\n`/admin` — админ панель"
+    if APPLY_DEEPLINK:
+        text += f"\n\n🔗 Быстрая подача заявки: `{APPLY_DEEPLINK}`"
     await message.answer(
         text,
         parse_mode=ParseMode.MARKDOWN,
@@ -1163,21 +1396,11 @@ async def cmd_start(message: Message):
 @router.message(F.text == "/help")
 async def cmd_help(message: Message):
     await message.answer(
-        "ℹ️ *Справка*\n"
-        "`/apply` — подать заявку\n"
-        "`/status` — статус заявки\n"
-        "`/cancel` — отменить анкету\n"
-        "`/edit` — редактировать активную заявку\n"
-        "`/support` — техподдержка (тикеты)\n"
-        "`/my_tickets` — мои тикеты\n"
-        "`/feedback` — оставить отзыв\n"
-        "`/admin` — админ панель (админ)\n"
-        "`/tickets` — список тикетов (админ)\n"
-        "`/ban_user <tg_id>` — бан по Telegram ID (админ)\n"
-        "`/unban_user <tg_id>` — разбан по Telegram ID (админ)\n"
-        "`/ban_nick <nick>` — бан по нику (админ)\n"
-        "`/unban_nick <nick>` — разбан по нику (админ)\n"
-        "`/archive` — архивировать старые заявки (админ)\n",
+        f"{fmt_header('Справка ' + BRAND)}\n"
+        f"{fmt_section('Основные', '`/apply` — подать заявку\\n`/status` — статус заявки\\n`/cancel` — отменить анкету\\n`/edit` — редактировать активную заявку')}\n"
+        f"{fmt_section('Поддержка', '`/support` — техподдержка (тикеты)\\n`/my_tickets` — мои тикеты\\n`/feedback` — оставить отзыв')}\n"
+        f"{fmt_section('Админ', '`/admin` — админ панель\\n`/tickets` — тикеты\\n`/ticket_search` — поиск тикетов\\n`/ban_user <tg_id>` — бан TG\\n`/unban_user <tg_id>` — разбан TG\\n`/ban_nick <nick>` — бан ника\\n`/unban_nick <nick>` — разбан ника\\n`/archive` — архивировать старые заявки')}"
+        + (f"\n\n🔗 Быстрая заявка: `{APPLY_DEEPLINK}`" if APPLY_DEEPLINK else ""),
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1212,7 +1435,7 @@ async def cmd_apply(message: Message, bot: Bot):
 
     save_form_state(message.from_user.id, 0, {}, None)
     await message.answer(
-        "🔥 *Анкета на сервер*\n"
+        f"{fmt_header('Анкета ' + BRAND)}\n"
         "Ответь на вопросы по порядку.\n"
         "Отмена: `/cancel`",
         parse_mode=ParseMode.MARKDOWN,
@@ -1233,7 +1456,7 @@ async def cmd_edit(message: Message, bot: Bot):
 
     save_form_state(message.from_user.id, 0, {}, last_id)
     await message.answer(
-        "✏️ *Редактирование заявки*\n"
+        f"{fmt_header('Редактирование заявки')}\n"
         "Ответь на вопросы по порядку.\n"
         "Отмена: `/cancel`",
         parse_mode=ParseMode.MARKDOWN,
@@ -1251,10 +1474,11 @@ async def cmd_status(message: Message):
 
     app_id, nick, status, created_at = last
     await message.answer(
-        f"📌 *Последняя заявка* `#{app_id}`\n"
-        f"🎮 Ник: `{nick}`\n"
-        f"📍 Статус: *{status}*\n"
-        f"🕒 Дата: {format_date(created_at)}",
+        f"{fmt_header('Статус заявки')}\n"
+        f"{fmt_kv('ID', f'`#{app_id}`')}\n"
+        f"{fmt_kv('Ник', f'`{nick}`')}\n"
+        f"{fmt_kv('Статус', f'*{status}*')}\n"
+        f"{fmt_kv('Дата', format_date(created_at))}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1305,8 +1529,8 @@ async def cmd_support(message: Message):
             resize_keyboard=True,
         )
         await message.answer(
-            "🛟 *Техподдержка*\n"
-            "Напиши тему обращения (кратко одним сообщением).",
+            f"{fmt_header('Техподдержка ' + BRAND)}\n"
+            "Напиши тему обращения коротко одним сообщением.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard,
         )
@@ -1352,16 +1576,21 @@ async def cmd_feedback(message: Message):
         )
         return
     SELECTED_NICK_BY_USER[message.from_user.id] = selected_nick or ""
-    text = (
-        "💬 *Отзыв*\n"
-        "Напиши короткий отзыв: что понравилось, что улучшить."
+    FEEDBACK_DRAFT_BY_USER[message.from_user.id] = {"selected_nick": selected_nick or ""}
+    PENDING_INPUT_MODE[message.from_user.id] = "feedback_target"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [make_button("🌍 Отзыв о сервере", "feedback_target:server")],
+            [make_button("🤖 Отзыв о боте", "feedback_target:bot")],
+        ]
     )
-    PENDING_INPUT_MODE[message.from_user.id] = "feedback"
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_CANCEL)]],
-        resize_keyboard=True,
+    await message.answer(
+        f"💬 *Отзывы {BRAND}*\n"
+        f"{ACCENT_LINE}\n"
+        "Выбери, о чём отзыв:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
     )
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
 @router.message(F.text == "/tickets")
@@ -1370,6 +1599,15 @@ async def cmd_tickets(message: Message, bot: Bot):
         await message.answer("Нет прав.")
         return
     await send_ticket_list(bot, message.chat.id, 1, for_admin=True)
+
+
+@router.message(F.text == "/ticket_search")
+async def cmd_ticket_search(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "ticket_search"
+    await message.answer("🔎 Введи поиск по тикетам (тема, @username или id):")
 
 
 @router.message(F.text == "/my_tickets")
@@ -1400,6 +1638,8 @@ async def cmd_cancel(message: Message):
         mode = PENDING_INPUT_MODE.pop(message.from_user.id, None)
         if mode in ("ticket_subject", "ticket_body"):
             TICKET_DRAFT_BY_USER.pop(message.from_user.id, None)
+        if mode in ("feedback_target", "feedback_rating", "feedback_text"):
+            FEEDBACK_DRAFT_BY_USER.pop(message.from_user.id, None)
         canceled = True
 
     if canceled:
@@ -1443,17 +1683,18 @@ async def cmd_pending(message: Message, bot: Bot, page: int = 1):
         username_part = f"@{username}" if username else "без username"
         who = f"{q_name or '—'} / {username_part} / id {user_id}"
         text = (
-            f"*Заявка* `#{app_id}`\n"
-            f"🎮 Ник: `{nick}`\n"
-            f"👤 Как обращаться: {q_name or '—'}\n"
-            f"🎂 Возраст: {q_age or '—'}\n"
-            f"🧩 Моды/версии: {q_mods or '—'}\n"
-            f"🎧 Войс (слушать): {q_voice_listen or '—'}\n"
-            f"🎤 Войс (говорить): {q_voice_speak or '—'}\n"
-            f"💻 Устройство: {q_device or '—'}\n"
-            f"🧭 Планы: {q_plans or '—'}\n"
-            f"💰 Хост: {q_host or '—'}\n"
-            f"📎 От: {who}"
+            f"{fmt_header('Заявка')}\n"
+            f"{fmt_kv('ID', f'`#{app_id}`')}\n"
+            f"{fmt_kv('Ник', f'`{nick}`')}\n"
+            f"{fmt_kv('Как обращаться', q_name or '—')}\n"
+            f"{fmt_kv('Возраст', q_age or '—')}\n"
+            f"{fmt_kv('Моды/версии', q_mods or '—')}\n"
+            f"{fmt_kv('Войс (слушать)', q_voice_listen or '—')}\n"
+            f"{fmt_kv('Войс (говорить)', q_voice_speak or '—')}\n"
+            f"{fmt_kv('Устройство', q_device or '—')}\n"
+            f"{fmt_kv('Планы', q_plans or '—')}\n"
+            f"{fmt_kv('Хост', q_host or '—')}\n"
+            f"{fmt_kv('От', who)}"
         )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1592,7 +1833,8 @@ async def cmd_stats(message: Message):
         f"Ожидают: {s['pending']}\n"
         f"Одобрено: {s['approved']}\n"
         f"Отклонено: {s['rejected']}\n"
-        f"Архив: {s['archived']}",
+        f"Архив: {s['archived']}\n"
+        f"Средняя оценка решений: {s['avg_rating']:.2f}⭐",
     )
 
 
@@ -1673,6 +1915,30 @@ async def on_btn_status(message: Message):
     await cmd_status(message)
 
 
+@router.message(F.text == BTN_ACCOUNTS)
+async def on_btn_accounts(message: Message):
+    nicks = get_user_accounts(message.from_user.id)
+    if not nicks:
+        await message.answer(
+            f"👥 *Аккаунты {BRAND}*\n"
+            f"{ACCENT_LINE}\n"
+            "У тебя пока нет одобренных ников.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    primary = get_user_selected_nick(message.from_user.id)
+    if primary not in nicks:
+        primary = nicks[0]
+        set_user_selected_nick(message.from_user.id, primary)
+    await message.answer(
+        f"👥 *Аккаунты {BRAND}*\n"
+        f"{ACCENT_LINE}\n"
+        "Твои ники:\n" + "\n".join([f"• `{n}`" for n in nicks]) + f"\n\n⭐ Основной: `{primary}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=build_accounts_panel(nicks, primary),
+    )
+
+
 @router.message(F.text == BTN_ADMIN)
 async def on_btn_admin(message: Message):
     if not is_admin(message.from_user.id):
@@ -1687,6 +1953,18 @@ async def cmd_admin(message: Message):
         await message.answer("Нет прав.")
         return
     await message.answer("🛠️ *Админ панель*", parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_panel())
+
+
+@router.my_chat_member()
+async def on_bot_added(event: ChatMemberUpdated):
+    chat = event.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    new_status = event.new_chat_member.status
+    if new_status not in ("member", "administrator"):
+        return
+    GROUP_CHAT_IDS.add(chat.id)
+    save_config_group_ids()
 
 
 @router.message(F.text == BTN_PENDING)
@@ -1843,9 +2121,25 @@ async def on_text(message: Message, bot: Bot):
         await message.answer(f"Заявка #{app_id} отклонена.")
         try:
             if reason:
-                await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.\nПричина: {reason}")
+                await bot.send_message(target_user_id, f"{fmt_header('Заявка отклонена')}\n{fmt_kv('ID', f'`#{app_id}`')}\n{fmt_kv('Причина', reason)}", parse_mode=ParseMode.MARKDOWN)
             else:
-                await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.")
+                await bot.send_message(target_user_id, f"{fmt_header('Заявка отклонена')}\n{fmt_kv('ID', f'`#{app_id}`')}", parse_mode=ParseMode.MARKDOWN)
+            if not has_bot_rating(target_user_id, app_id):
+                rate_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        make_button("⭐1", f"rate:{app_id}:1"),
+                        make_button("⭐2", f"rate:{app_id}:2"),
+                        make_button("⭐3", f"rate:{app_id}:3"),
+                        make_button("⭐4", f"rate:{app_id}:4"),
+                        make_button("⭐5", f"rate:{app_id}:5"),
+                        make_button("⏭️ Пропустить", f"rate:{app_id}:skip"),
+                    ]]
+                )
+                await bot.send_message(
+                    target_user_id,
+                    "Оцени работу бота (1–5):",
+                    reply_markup=rate_kb,
+                )
         except Exception:
             pass
         return
@@ -1855,7 +2149,7 @@ async def on_text(message: Message, bot: Bot):
         text = (message.text or "").strip()
         if mode == "ticket_subject":
             if not text:
-                await message.answer("Тема не может быть пустой. Попробуй ещё раз.")
+                await message.answer(f"{fmt_header('Техподдержка')}\nТема не может быть пустой. Попробуй ещё раз.", parse_mode=ParseMode.MARKDOWN)
                 return
             draft = TICKET_DRAFT_BY_USER.get(user_id, {})
             draft["subject"] = text
@@ -1865,7 +2159,7 @@ async def on_text(message: Message, bot: Bot):
             return
         if mode == "ticket_body":
             if not text:
-                await message.answer("Сообщение пустое. Попробуй ещё раз.")
+                await message.answer(f"{fmt_header('Техподдержка')}\nСообщение пустое. Попробуй ещё раз.", parse_mode=ParseMode.MARKDOWN)
                 return
             draft = TICKET_DRAFT_BY_USER.pop(user_id, {})
             subject = draft.get("subject") or "Без темы"
@@ -1873,12 +2167,12 @@ async def on_text(message: Message, bot: Bot):
             selected_nick = draft.get("selected_nick") or SELECTED_NICK_BY_USER.get(user_id)
             ticket_id = create_ticket(user_id, message.from_user.username, selected_nick, topic, subject)
             add_ticket_message(ticket_id, "user_text", text, None, None)
-            await message.answer("✅ Тикет создан.", reply_markup=build_main_menu(message.from_user.id))
+            await message.answer(f"{fmt_header('Тикет создан')}\nID: `#{ticket_id}`", parse_mode=ParseMode.MARKDOWN, reply_markup=build_main_menu(message.from_user.id))
             await send_ticket_view(bot, message.chat.id, ticket_id, for_admin=False)
             admin_kb = InlineKeyboardMarkup(
                 inline_keyboard=[[make_button("Открыть тикет", f"ticket_admin_view:{ticket_id}")]]
             )
-            await notify_admins(bot, f"🆕 Новый тикет `#{ticket_id}`", admin_kb)
+            await notify_admins(bot, f"🆕 Новый тикет `#{ticket_id}` ({BRAND})", admin_kb)
             return
         if mode.startswith("ticket_reply:"):
             try:
@@ -1886,11 +2180,15 @@ async def on_text(message: Message, bot: Bot):
             except Exception:
                 await message.answer("Некорректный тикет.")
                 return
+            ticket = get_ticket(ticket_id)
+            if not ticket or ticket[6] == "closed":
+                await message.answer("Тикет закрыт.")
+                return
             if not text:
                 await message.answer("Сообщение пустое.")
                 return
             add_ticket_message(ticket_id, "admin_text", text, None, None)
-            await message.answer("✅ Ответ отправлен.")
+            await message.answer(f"{fmt_header('Ответ отправлен')}\nID: `#{ticket_id}`", parse_mode=ParseMode.MARKDOWN)
             ticket = get_ticket(ticket_id)
             if ticket:
                 _id, target_user_id, _username, _topic, _subject, _selected_nick, _status, _created, _updated = ticket
@@ -1913,21 +2211,56 @@ async def on_text(message: Message, bot: Bot):
                 await message.answer("Сообщение пустое.")
                 return
             add_ticket_message(ticket_id, "user_text", text, None, None)
-            await message.answer("Сообщение добавлено.")
+            await message.answer(f"{fmt_header('Сообщение добавлено')}\nID: `#{ticket_id}`", parse_mode=ParseMode.MARKDOWN)
             await notify_admins(bot, f"💬 Новое сообщение в тикете #{ticket_id}")
             return
-        if mode == "feedback":
-            if not text:
-                await message.answer("Сообщение пустое. Попробуй ещё раз.")
+        if mode == "account_add":
+            nick = text
+            if not MINECRAFT_NICK_RE.match(nick):
+                await message.answer("Ник должен быть 3–16 символов: латиница, цифры, `_`.")
                 return
+            if nick.lower() in BAN_NICKS:
+                await message.answer("Этот ник в бан-листе.")
+                return
+            if count_user_accounts(user_id) == 0:
+                await message.answer("Сначала нужен хотя бы один одобренный ник.")
+                return
+            if count_user_accounts(user_id) >= 2:
+                await message.answer("Максимум 2 аккаунта.")
+                return
+            if account_exists(nick):
+                await message.answer("Этот ник уже используется.")
+                return
+            if not await health_check():
+                await message.answer("Сервер недоступен. Попробуй позже.")
+                return
+            ok = await call_plugin("approve", nick)
+            if not ok:
+                await message.answer("Плагин недоступен. Попробуй позже.")
+                return
+            add_user_account(user_id, nick)
+            log_account_action(user_id, nick, "add")
+            await message.answer(f"{fmt_header('Ник добавлен')}\nНик: `{nick}`", parse_mode=ParseMode.MARKDOWN, reply_markup=build_main_menu(message.from_user.id))
+            return
+        if mode in ("feedback_target", "feedback_rating"):
+            await message.answer("Пожалуйста, выбери вариант кнопкой.")
+            return
+        if mode == "feedback_text":
+            if text == BTN_SKIP:
+                text = ""
+            draft = FEEDBACK_DRAFT_BY_USER.pop(user_id, {})
             kind = "feedback"
+            target = draft.get("target") or "server"
+            rating = int(draft.get("rating") or 0) or None
             with db_connect() as conn:
                 conn.execute(
-                    "INSERT INTO feedback (user_id, username, kind, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO feedback (user_id, username, kind, target, rating, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         user_id,
                         message.from_user.username,
                         kind,
+                        target,
+                        rating,
                         text,
                         int(time.time()),
                     ),
@@ -1935,12 +2268,18 @@ async def on_text(message: Message, bot: Bot):
             await message.answer("✅ Спасибо! Отзыв отправлен.")
             selected = SELECTED_NICK_BY_USER.get(user_id)
             approved = selected or get_latest_approved_nick(user_id) or get_first_approved_nick(user_id)
+            target_label = "сервер" if target == "server" else "бот"
+            stars = "⭐" * rating if rating else "—"
+            comment_line = text if text else "—"
+            user_tag = f"@{message.from_user.username}" if message.from_user.username else "без username"
             await notify_admins(
                 bot,
-                f"💬 Отзыв\n"
-                f"От: @{message.from_user.username or 'без username'} (id {user_id})\n"
-                f"Одобренный ник: {approved or 'нет'}\n"
-                f"Сообщение: {text}",
+                f"{fmt_header('Отзыв')}\n"
+                f"{fmt_kv('От', f'{user_tag} (id {user_id})')}\n"
+                f"{fmt_kv('Одобренный ник', approved or 'нет')}\n"
+                f"{fmt_kv('Категория', target_label)}\n"
+                f"{fmt_kv('Оценка', stars)}\n"
+                f"{fmt_kv('Комментарий', comment_line)}",
             )
             return
         if mode == "show":
@@ -1965,29 +2304,65 @@ async def on_text(message: Message, bot: Bot):
             if not text.isdigit():
                 await message.answer("Нужен числовой Telegram ID.")
                 return
-            BAN_USER_IDS.add(int(text))
-            await message.answer(f"Пользователь {text} добавлен в бан-лист.")
+            PENDING_INPUT_MODE[user_id] = f"ban_user_confirm:{text}"
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_button("✅ Подтвердить", f"ban_user_confirm:{text}")],
+                    [make_button("❌ Отмена", "ban_user_cancel")],
+                ]
+            )
+            await message.answer(f"Подтвердить бан пользователя {text}?", reply_markup=kb)
             return
         if mode == "unban_user":
             if not text.isdigit():
                 await message.answer("Нужен числовой Telegram ID.")
                 return
-            BAN_USER_IDS.discard(int(text))
-            await message.answer(f"Пользователь {text} удалён из бан-листа.")
+            PENDING_INPUT_MODE[user_id] = f"unban_user_confirm:{text}"
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_button("✅ Подтвердить", f"unban_user_confirm:{text}")],
+                    [make_button("❌ Отмена", "unban_user_cancel")],
+                ]
+            )
+            await message.answer(f"Подтвердить разбан пользователя {text}?", reply_markup=kb)
             return
         if mode == "ban_nick":
             if not text:
                 await message.answer("Ник пустой.")
                 return
-            BAN_NICKS.add(text.lower())
-            await message.answer(f"Ник {text} добавлен в бан-лист.")
+            PENDING_INPUT_MODE[user_id] = f"ban_nick_confirm:{text}"
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_button("✅ Подтвердить", f"ban_nick_confirm:{text}")],
+                    [make_button("❌ Отмена", "ban_nick_cancel")],
+                ]
+            )
+            await message.answer(f"Подтвердить бан ника {text}?", reply_markup=kb)
             return
         if mode == "unban_nick":
             if not text:
                 await message.answer("Ник пустой.")
                 return
-            BAN_NICKS.discard(text.lower())
-            await message.answer(f"Ник {text} удалён из бан-листа.")
+            PENDING_INPUT_MODE[user_id] = f"unban_nick_confirm:{text}"
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_button("✅ Подтвердить", f"unban_nick_confirm:{text}")],
+                    [make_button("❌ Отмена", "unban_nick_cancel")],
+                ]
+            )
+            await message.answer(f"Подтвердить разбан ника {text}?", reply_markup=kb)
+            return
+        if mode == "ticket_search":
+            rows = search_tickets(text, 10)
+            if not rows:
+                await message.answer("Ничего не найдено.")
+                return
+            lines = ["🔎 Результаты поиска тикетов (до 10):"]
+            for tid, uid, username, topic, subject, status, created_at, updated_at in rows:
+                topic_label = next((label for key, label in TICKET_TOPICS if key == topic), topic or "—")
+                who = f"@{username}" if username else f"id {uid}"
+                lines.append(f"#{tid} — {topic_label} — {subject or '—'} — {who} — {status}")
+            await message.answer("\n".join(lines))
             return
 
     state = load_form_state(user_id)
@@ -2060,11 +2435,19 @@ async def on_support_media(message: Message):
             ticket_id = int(mode.split(":", 1)[1])
         except Exception:
             return
+        ticket = get_ticket(ticket_id)
+        if not ticket or ticket[6] == "closed":
+            await message.answer("Тикет закрыт.")
+            return
         kind_prefix = "admin_"
     elif mode.startswith("ticket_add:"):
         try:
             ticket_id = int(mode.split(":", 1)[1])
         except Exception:
+            return
+        ticket = get_ticket(ticket_id)
+        if not ticket or ticket[6] == "closed":
+            await message.answer("Тикет закрыт.")
             return
         kind_prefix = "user_"
     else:
@@ -2241,6 +2624,10 @@ async def on_callback(call: CallbackQuery, bot: Bot):
         except Exception:
             await call.answer("Некорректный тикет.")
             return
+        ticket = get_ticket(ticket_id)
+        if not ticket or ticket[6] == "closed":
+            await call.answer("Тикет закрыт.")
+            return
         PENDING_INPUT_MODE[user_id] = f"ticket_reply:{ticket_id}"
         await bot.send_message(call.message.chat.id, f"Ответ для тикета #{ticket_id}:")
         await call.answer()
@@ -2263,6 +2650,57 @@ async def on_callback(call: CallbackQuery, bot: Bot):
         await bot.send_message(
             call.message.chat.id,
             "Напиши тему обращения (кратко одним сообщением).",
+            reply_markup=keyboard,
+        )
+        await call.answer()
+        return
+
+    if data.startswith("feedback_target:"):
+        target = data.split(":", 1)[1]
+        if target not in ("server", "bot"):
+            await call.answer("Некорректная категория.")
+            return
+        draft = FEEDBACK_DRAFT_BY_USER.get(user_id, {})
+        draft["target"] = target
+        FEEDBACK_DRAFT_BY_USER[user_id] = draft
+        PENDING_INPUT_MODE[user_id] = "feedback_rating"
+        stars = [
+            [
+                make_button("⭐ 1", "feedback_rating:1"),
+                make_button("⭐ 2", "feedback_rating:2"),
+                make_button("⭐ 3", "feedback_rating:3"),
+                make_button("⭐ 4", "feedback_rating:4"),
+                make_button("⭐ 5", "feedback_rating:5"),
+            ]
+        ]
+        await bot.send_message(
+            call.message.chat.id,
+            f"Оцени от 1 до 5:\n{ACCENT_LINE}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=stars),
+        )
+        await call.answer()
+        return
+
+    if data.startswith("feedback_rating:"):
+        try:
+            rating = int(data.split(":", 1)[1])
+        except Exception:
+            await call.answer("Некорректная оценка.")
+            return
+        if rating < 1 or rating > 5:
+            await call.answer("Некорректная оценка.")
+            return
+        draft = FEEDBACK_DRAFT_BY_USER.get(user_id, {})
+        draft["rating"] = str(rating)
+        FEEDBACK_DRAFT_BY_USER[user_id] = draft
+        PENDING_INPUT_MODE[user_id] = "feedback_text"
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=BTN_SKIP), KeyboardButton(text=BTN_CANCEL)]],
+            resize_keyboard=True,
+        )
+        await bot.send_message(
+            call.message.chat.id,
+            "Напиши комментарий к оценке (или пропусти):",
             reply_markup=keyboard,
         )
         await call.answer()
@@ -2300,7 +2738,7 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await call.answer("Нет прав.")
             return
         set_ticket_status(ticket_id, "closed")
-        await bot.send_message(call.message.chat.id, f"Тикет #{ticket_id} закрыт.")
+        await bot.send_message(call.message.chat.id, f"{fmt_header('Тикет закрыт')}\nID: `#{ticket_id}`", parse_mode=ParseMode.MARKDOWN)
         _id, owner_id, _username, _topic, _subject, _selected_nick, _status, _created, _updated = ticket
         if is_admin(user_id) and owner_id != user_id:
             try:
@@ -2326,7 +2764,7 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await call.answer("Нет прав.")
             return
         set_ticket_status(ticket_id, "open")
-        await bot.send_message(call.message.chat.id, f"Тикет #{ticket_id} снова открыт.")
+        await bot.send_message(call.message.chat.id, f"{fmt_header('Тикет открыт')}\nID: `#{ticket_id}`", parse_mode=ParseMode.MARKDOWN)
         _id, owner_id, _username, _topic, _subject, _selected_nick, _status, _created, _updated = ticket
         if is_admin(user_id) and owner_id != user_id:
             try:
@@ -2335,6 +2773,197 @@ async def on_callback(call: CallbackQuery, bot: Bot):
                 pass
         if not is_admin(user_id):
             await notify_admins(bot, f"🔓 Пользователь открыл тикет #{ticket_id}")
+        await call.answer()
+        return
+
+    if data.startswith("rate:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await call.answer("Некорректные данные.")
+            return
+        try:
+            app_id = int(parts[1])
+        except Exception:
+            await call.answer("Некорректный ID.")
+            return
+        value = parts[2]
+        if value == "skip":
+            await call.message.edit_text("Ок, оценка пропущена.")
+            await call.answer()
+            return
+        try:
+            rating = int(value)
+        except Exception:
+            await call.answer("Некорректная оценка.")
+            return
+        if rating < 1 or rating > 5:
+            await call.answer("Некорректная оценка.")
+            return
+        if has_bot_rating(user_id, app_id):
+            await call.answer("Оценка уже сохранена.")
+            return
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO feedback (user_id, username, kind, target, rating, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    call.from_user.username,
+                    "bot_rating",
+                    "bot",
+                    rating,
+                    str(app_id),
+                    int(time.time()),
+                ),
+            )
+        await call.message.edit_text("Спасибо за оценку!")
+        await call.answer()
+        return
+
+    if data == "acc_add":
+        if count_user_accounts(user_id) == 0:
+            await call.answer("Сначала нужно получить хотя бы один одобренный ник.")
+            return
+        if count_user_accounts(user_id) >= 2:
+            await call.answer("Максимум 2 аккаунта.")
+            return
+        PENDING_INPUT_MODE[user_id] = "account_add"
+        await bot.send_message(call.message.chat.id, "Введи ник для добавления (3–16, латиница/цифры/_):")
+        await call.answer()
+        return
+
+    if data.startswith("acc_del:"):
+        nick = data.split(":", 1)[1]
+        if not nick:
+            await call.answer("Некорректный ник.")
+            return
+        confirm_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [make_button("✅ Да, удалить", f"acc_del_confirm:{nick}")],
+                [make_button("❌ Отмена", "acc_del_cancel")],
+            ]
+        )
+        await bot.send_message(
+            call.message.chat.id,
+            f"Ты точно хочешь удалить ник `{nick}` из вайтлиста?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=confirm_kb,
+        )
+        await call.answer()
+        return
+
+    if data == "acc_del_cancel":
+        await call.answer("Отменено.")
+        return
+
+    if data.startswith("acc_del_confirm:"):
+        nick = data.split(":", 1)[1]
+        if not nick:
+            await call.answer("Некорректный ник.")
+            return
+        if not await health_check():
+            await call.answer("Сервер недоступен.", show_alert=True)
+            return
+        ok = await call_plugin("remove", nick)
+        if not ok:
+            await call.answer("Плагин недоступен.", show_alert=True)
+            return
+        if remove_user_account(user_id, nick):
+            log_account_action(user_id, nick, "remove")
+            primary = get_user_selected_nick(user_id)
+            if primary and primary.lower() == nick.lower():
+                nicks = get_user_accounts(user_id)
+                if nicks:
+                    set_user_selected_nick(user_id, nicks[0])
+                else:
+                    set_user_selected_nick(user_id, None)
+            await call.answer("Ник удалён.")
+        else:
+            await call.answer("Не найден.")
+        nicks = get_user_accounts(user_id)
+        primary = get_user_selected_nick(user_id)
+        await bot.send_message(
+            call.message.chat.id,
+            f"{fmt_header('Аккаунты')}\n"
+            "Твои ники:\n" + ("\n".join([f"• `{n}`" for n in nicks]) if nicks else "—") +
+            (f"\n\n⭐ Основной: `{primary}`" if primary else ""),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_accounts_panel(nicks, primary) if nicks else None,
+        )
+        return
+
+    if data.startswith("acc_primary:"):
+        nick = data.split(":", 1)[1]
+        if not nick:
+            await call.answer("Некорректный ник.")
+            return
+        nicks = get_user_accounts(user_id)
+        if nick not in nicks:
+            await call.answer("Ник не найден.")
+            return
+        set_user_selected_nick(user_id, nick)
+        await call.answer("Основной ник обновлён.")
+        await bot.send_message(
+            call.message.chat.id,
+            f"👥 *Аккаунты {BRAND}*\n"
+            f"{ACCENT_LINE}\n"
+            "Твои ники:\n" + "\n".join([f"• `{n}`" for n in nicks]) + f"\n\n⭐ Основной: `{nick}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_accounts_panel(nicks, nick),
+        )
+        return
+
+    if data == "ban_user_cancel":
+        await call.answer("Отменено.")
+        return
+    if data == "unban_user_cancel":
+        await call.answer("Отменено.")
+        return
+    if data == "ban_nick_cancel":
+        await call.answer("Отменено.")
+        return
+    if data == "unban_nick_cancel":
+        await call.answer("Отменено.")
+        return
+
+    if data.startswith("ban_user_confirm:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except Exception:
+            await call.answer("Некорректный ID.")
+            return
+        BAN_USER_IDS.add(target_id)
+        await call.message.edit_text(f"Пользователь {target_id} добавлен в бан-лист.")
+        await call.answer()
+        return
+
+    if data.startswith("unban_user_confirm:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except Exception:
+            await call.answer("Некорректный ID.")
+            return
+        BAN_USER_IDS.discard(target_id)
+        await call.message.edit_text(f"Пользователь {target_id} удалён из бан-листа.")
+        await call.answer()
+        return
+
+    if data.startswith("ban_nick_confirm:"):
+        nick = data.split(":", 1)[1]
+        if not nick:
+            await call.answer("Некорректный ник.")
+            return
+        BAN_NICKS.add(nick.lower())
+        await call.message.edit_text(f"Ник {nick} добавлен в бан-лист.")
+        await call.answer()
+        return
+
+    if data.startswith("unban_nick_confirm:"):
+        nick = data.split(":", 1)[1]
+        if not nick:
+            await call.answer("Некорректный ник.")
+            return
+        BAN_NICKS.discard(nick.lower())
+        await call.message.edit_text(f"Ник {nick} удалён из бан-листа.")
         await call.answer()
         return
 
@@ -2362,6 +2991,9 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await cmd_stats(call.message)
         elif action == "tickets":
             await send_ticket_list(bot, call.message.chat.id, 1, for_admin=True)
+        elif action == "ticket_search":
+            PENDING_INPUT_MODE[user_id] = "ticket_search"
+            await bot.send_message(call.message.chat.id, "🔎 Введи поиск по тикетам (тема, @username или id):")
         elif action == "health":
             await cmd_health(call.message)
         elif action == "ban_user":
@@ -2418,19 +3050,20 @@ async def on_callback(call: CallbackQuery, bot: Bot):
         username_part = f"@{username}" if username else "без username"
         who = f"{q_name or '—'} / {username_part} / id {user_id2}"
         text = (
-            f"*Заявка* `#{app_id}`\n"
-            f"🎮 Ник: `{nick}`\n"
-            f"👤 Как обращаться: {q_name or '—'}\n"
-            f"🎂 Возраст: {q_age or '—'}\n"
-            f"🧩 Моды/версии: {q_mods or '—'}\n"
-            f"🎧 Войс (слушать): {q_voice_listen or '—'}\n"
-            f"🎤 Войс (говорить): {q_voice_speak or '—'}\n"
-            f"💻 Устройство: {q_device or '—'}\n"
-            f"🧭 Планы: {q_plans or '—'}\n"
-            f"💰 Хост: {q_host or '—'}\n"
-            f"📎 От: {who}\n"
-            f"📍 Статус: *{status}*\n"
-            f"🕒 Дата: {format_date(created_at)}"
+            f"{fmt_header('Заявка')}\n"
+            f"{fmt_kv('ID', f'`#{app_id}`')}\n"
+            f"{fmt_kv('Ник', f'`{nick}`')}\n"
+            f"{fmt_kv('Как обращаться', q_name or '—')}\n"
+            f"{fmt_kv('Возраст', q_age or '—')}\n"
+            f"{fmt_kv('Моды/версии', q_mods or '—')}\n"
+            f"{fmt_kv('Войс (слушать)', q_voice_listen or '—')}\n"
+            f"{fmt_kv('Войс (говорить)', q_voice_speak or '—')}\n"
+            f"{fmt_kv('Устройство', q_device or '—')}\n"
+            f"{fmt_kv('Планы', q_plans or '—')}\n"
+            f"{fmt_kv('Хост', q_host or '—')}\n"
+            f"{fmt_kv('От', who)}\n"
+            f"{fmt_kv('Статус', f'*{status}*')}\n"
+            f"{fmt_kv('Дата', format_date(created_at))}"
         )
         keyboard = None
         if status == "pending":
@@ -2481,9 +3114,25 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             return
         set_status(app_id, "rejected")
         log_decision(app_id, user_id, call.from_user.username, "reject", None)
-        await call.message.edit_text(f"Заявка #{app_id} отклонена.")
+        await call.message.edit_text(f"{fmt_header('Заявка отклонена')}\nID: `#{app_id}`", parse_mode=ParseMode.MARKDOWN)
         try:
             await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.")
+            if not has_bot_rating(target_user_id, app_id):
+                rate_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        make_button("⭐1", f"rate:{app_id}:1"),
+                        make_button("⭐2", f"rate:{app_id}:2"),
+                        make_button("⭐3", f"rate:{app_id}:3"),
+                        make_button("⭐4", f"rate:{app_id}:4"),
+                        make_button("⭐5", f"rate:{app_id}:5"),
+                        make_button("⏭️ Пропустить", f"rate:{app_id}:skip"),
+                    ]]
+                )
+                await bot.send_message(
+                    target_user_id,
+                    "Оцени работу бота (1–5):",
+                    reply_markup=rate_kb,
+                )
         except Exception:
             pass
         await call.answer()
@@ -2532,9 +3181,25 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             return
         set_status(app_id, "rejected")
         log_decision(app_id, user_id, call.from_user.username, "reject", reason)
-        await call.message.edit_text(f"Заявка #{app_id} отклонена.")
+        await call.message.edit_text(f"{fmt_header('Заявка отклонена')}\nID: `#{app_id}`", parse_mode=ParseMode.MARKDOWN)
         try:
             await bot.send_message(target_user_id, f"Ваша заявка #{app_id} отклонена.\nПричина: {reason}")
+            if not has_bot_rating(target_user_id, app_id):
+                rate_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        make_button("⭐1", f"rate:{app_id}:1"),
+                        make_button("⭐2", f"rate:{app_id}:2"),
+                        make_button("⭐3", f"rate:{app_id}:3"),
+                        make_button("⭐4", f"rate:{app_id}:4"),
+                        make_button("⭐5", f"rate:{app_id}:5"),
+                        make_button("⏭️ Пропустить", f"rate:{app_id}:skip"),
+                    ]]
+                )
+                await bot.send_message(
+                    target_user_id,
+                    "Оцени работу бота (1–5):",
+                    reply_markup=rate_kb,
+                )
         except Exception:
             pass
         await call.answer()
