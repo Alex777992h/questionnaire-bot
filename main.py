@@ -4,6 +4,8 @@ import time
 import re
 import sqlite3
 import logging
+import csv
+import zipfile
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
 
@@ -56,6 +58,10 @@ DEFAULT_CONFIG = {
     "tickets_page_size": 5,
     "bot_username": "infinitycraftmembers_bot",
     "group_chat_ids": [],
+    "reminder_interval_minutes": 120,
+    "pending_reminder_hours": 24,
+    "ticket_reminder_hours": 24,
+    "profanity_words": ["мат", "хуй", "пизд", "еб", "сука", "бля"],
 }
 
 CONFIG_PATH = "config.json"
@@ -89,6 +95,10 @@ TICKETS_PAGE_SIZE = int(DEFAULT_CONFIG.get("tickets_page_size", 5))
 BOT_USERNAME = DEFAULT_CONFIG.get("bot_username", "").lstrip("@")
 APPLY_DEEPLINK = f"https://t.me/{BOT_USERNAME}?start=apply" if BOT_USERNAME else ""
 GROUP_CHAT_IDS = set(DEFAULT_CONFIG.get("group_chat_ids", []))
+REMINDER_INTERVAL_SECONDS = int(DEFAULT_CONFIG.get("reminder_interval_minutes", 120)) * 60
+PENDING_REMINDER_SECONDS = int(DEFAULT_CONFIG.get("pending_reminder_hours", 24)) * 3600
+TICKET_REMINDER_SECONDS = int(DEFAULT_CONFIG.get("ticket_reminder_hours", 24)) * 3600
+PROFANITY_WORDS = [w.lower() for w in DEFAULT_CONFIG.get("profanity_words", [])]
 
 # === DB PATH ===
 if os.path.exists("/app/data/"):
@@ -168,6 +178,7 @@ def fmt_kv(label: str, value: str) -> str:
 
 LAST_PLUGIN_ALERT_TS = 0
 LAST_CLEANUP_TS = 0
+LAST_REMINDER_TS = 0
 PENDING_REJECT_REASON: Dict[int, int] = {}
 PENDING_INPUT_MODE: Dict[int, str] = {}
 SELECTED_NICK_BY_USER: Dict[int, str] = {}
@@ -324,15 +335,17 @@ def db_connect() -> sqlite3.Connection:
 
 
 def save_config_group_ids():
+    save_config_updates({"group_chat_ids": sorted(GROUP_CHAT_IDS), "bot_username": BOT_USERNAME})
+
+
+def save_config_updates(updates: dict):
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
         else:
             cfg = {}
-        cfg["group_chat_ids"] = sorted(GROUP_CHAT_IDS)
-        if BOT_USERNAME:
-            cfg["bot_username"] = BOT_USERNAME
+        cfg.update(updates)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -678,6 +691,33 @@ def maybe_cleanup():
         pass
 
 
+async def maybe_send_reminders(bot: Bot):
+    global LAST_REMINDER_TS
+    now = time.time()
+    if now - LAST_REMINDER_TS < REMINDER_INTERVAL_SECONDS:
+        return
+    LAST_REMINDER_TS = now
+    try:
+        pending_old = get_pending_older_than(PENDING_REMINDER_SECONDS)
+        stale_tickets = get_stale_tickets(TICKET_REMINDER_SECONDS)
+        if pending_old > 0:
+            await notify_admins(
+                bot,
+                f"{fmt_header('Напоминание')}\n"
+                f"{fmt_kv('Заявки без ответа', str(pending_old))}\n"
+                f"{fmt_kv('Порог', f'{PENDING_REMINDER_SECONDS // 3600} ч')}",
+            )
+        if stale_tickets > 0:
+            await notify_admins(
+                bot,
+                f"{fmt_header('Напоминание')}\n"
+                f"{fmt_kv('Тикеты ждут ответа', str(stale_tickets))}\n"
+                f"{fmt_kv('Порог', f'{TICKET_REMINDER_SECONDS // 3600} ч')}",
+            )
+    except Exception:
+        pass
+
+
 def get_stats() -> Dict[str, int]:
     with db_connect() as conn:
         cur = conn.cursor()
@@ -872,6 +912,89 @@ def get_ticket_count(status: Optional[str] = None) -> int:
         return cur.fetchone()[0]
 
 
+def get_pending_older_than(seconds: int) -> int:
+    cutoff = int(time.time()) - seconds
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM applications WHERE status = 'pending' AND created_at < ?", (cutoff,))
+        return cur.fetchone()[0]
+
+
+def get_stale_tickets(seconds: int) -> int:
+    cutoff = int(time.time()) - seconds
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM support_sessions s "
+            "JOIN support_messages m ON m.session_id = s.id "
+            "WHERE s.status = 'open' AND m.id = (SELECT id FROM support_messages WHERE session_id = s.id ORDER BY id DESC LIMIT 1) "
+            "AND m.created_at < ? AND m.kind LIKE 'user_%'",
+            (cutoff,),
+        )
+        return cur.fetchone()[0]
+
+
+def get_counts_by_day(table: str, days: int = 7) -> List[tuple]:
+    since = int(time.time()) - days * 86400
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) as day, COUNT(*) "
+            f"FROM {table} WHERE created_at >= ? GROUP BY day ORDER BY day ASC",
+            (since,),
+        )
+        return cur.fetchall()
+
+
+def get_admin_decision_stats(limit: int = 5) -> List[tuple]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT admin_id, COALESCE(admin_username, ''), COUNT(*) as cnt "
+            "FROM decision_log GROUP BY admin_id, admin_username "
+            "ORDER BY cnt DESC LIMIT ?",
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def get_avg_decision_time_seconds() -> Optional[int]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT AVG(dl.created_at - a.created_at) "
+            "FROM applications a "
+            "JOIN decision_log dl ON dl.app_id = a.id "
+            "WHERE dl.action IN ('approve','reject')"
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+
+def get_avg_first_admin_reply_seconds() -> Optional[int]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT AVG(m.created_at - s.created_at) "
+            "FROM support_sessions s "
+            "JOIN support_messages m ON m.session_id = s.id "
+            "WHERE m.kind LIKE 'admin_%' "
+            "AND m.id = (SELECT id FROM support_messages WHERE session_id = s.id AND kind LIKE 'admin_%' ORDER BY id ASC LIMIT 1)"
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+
+def format_duration(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "—"
+    minutes = seconds // 60
+    hours = minutes // 60
+    if hours > 0:
+        return f"{hours}ч {minutes % 60}м"
+    return f"{minutes}м"
+
+
 def get_user_ticket_count(user_id: int) -> int:
     with db_connect() as conn:
         cur = conn.cursor()
@@ -987,6 +1110,11 @@ def format_date(ts: int) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
+def contains_profanity(text: str) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in PROFANITY_WORDS if w)
+
+
 def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text=BTN_APPLY), KeyboardButton(text=BTN_STATUS)],
@@ -1008,6 +1136,10 @@ def build_admin_panel() -> InlineKeyboardMarkup:
         [
             make_button("🔍 Поиск", "admin:search"),
             make_button("📊 Статистика", "admin:stats"),
+        ],
+        [
+            make_button("📈 Аналитика", "admin:analytics"),
+            make_button("📦 Экспорт", "admin:export"),
         ],
         [
             make_button("📮 Тикеты", "admin:tickets"),
@@ -1399,7 +1531,7 @@ async def cmd_help(message: Message):
         f"{fmt_header('Справка ' + BRAND)}\n"
         f"{fmt_section('Основные', '`/apply` — подать заявку\\n`/status` — статус заявки\\n`/cancel` — отменить анкету\\n`/edit` — редактировать активную заявку')}\n"
         f"{fmt_section('Поддержка', '`/support` — техподдержка (тикеты)\\n`/my_tickets` — мои тикеты\\n`/feedback` — оставить отзыв')}\n"
-        f"{fmt_section('Админ', '`/admin` — админ панель\\n`/tickets` — тикеты\\n`/ticket_search` — поиск тикетов\\n`/ban_user <tg_id>` — бан TG\\n`/unban_user <tg_id>` — разбан TG\\n`/ban_nick <nick>` — бан ника\\n`/unban_nick <nick>` — разбан ника\\n`/archive` — архивировать старые заявки')}"
+        f"{fmt_section('Админ', '`/admin` — админ панель\\n`/analytics` — аналитика\\n`/export` — экспорт CSV\\n`/tickets` — тикеты\\n`/ticket_search` — поиск тикетов\\n`/ban_user <tg_id>` — бан TG\\n`/unban_user <tg_id>` — разбан TG\\n`/ban_nick <nick>` — бан ника\\n`/unban_nick <nick>` — разбан ника\\n`/archive` — архивировать старые заявки')}"
         + (f"\n\n🔗 Быстрая заявка: `{APPLY_DEEPLINK}`" if APPLY_DEEPLINK else ""),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1408,6 +1540,7 @@ async def cmd_help(message: Message):
 @router.message(F.text == "/apply")
 async def cmd_apply(message: Message, bot: Bot):
     maybe_cleanup()
+    await maybe_send_reminders(bot)
     if is_rate_limited(message.from_user.id, "apply", RATE_LIMIT_SECONDS):
         await message.answer("Подожди секунду и попробуй снова.")
         return
@@ -1486,6 +1619,7 @@ async def cmd_status(message: Message):
 @router.message(F.text == "/support")
 async def cmd_support(message: Message):
     maybe_cleanup()
+    await maybe_send_reminders(message.bot)
     if is_rate_limited(message.from_user.id, "support", RATE_LIMIT_SECONDS):
         await message.answer("Подожди секунду и попробуй снова.")
         return
@@ -1550,6 +1684,7 @@ async def cmd_support(message: Message):
 @router.message(F.text == "/feedback")
 async def cmd_feedback(message: Message):
     maybe_cleanup()
+    await maybe_send_reminders(message.bot)
     if is_rate_limited(message.from_user.id, "feedback", RATE_LIMIT_SECONDS):
         await message.answer("Подожди секунду и попробуй снова.")
         return
@@ -1613,6 +1748,42 @@ async def cmd_ticket_search(message: Message):
 @router.message(F.text == "/my_tickets")
 async def cmd_my_tickets(message: Message, bot: Bot):
     await send_ticket_list(bot, message.chat.id, 1, for_admin=False, user_id=message.from_user.id)
+
+
+@router.message(F.text == "/export")
+async def cmd_export(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_zip = f"export_{ts}.zip"
+    apps_csv = f"applications_{ts}.csv"
+    tickets_csv = f"tickets_{ts}.csv"
+    accounts_csv = f"accounts_{ts}.csv"
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM applications")
+        apps = cur.fetchall()
+        app_cols = [d[0] for d in cur.description]
+        cur.execute("SELECT * FROM support_sessions")
+        tickets = cur.fetchall()
+        ticket_cols = [d[0] for d in cur.description]
+        cur.execute("SELECT * FROM user_accounts")
+        accounts = cur.fetchall()
+        acc_cols = [d[0] for d in cur.description]
+    for name, cols, rows in [
+        (apps_csv, app_cols, apps),
+        (tickets_csv, ticket_cols, tickets),
+        (accounts_csv, acc_cols, accounts),
+    ]:
+        with open(name, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            w.writerows(rows)
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in [apps_csv, tickets_csv, accounts_csv]:
+            zf.write(name)
+    await bot.send_document(message.chat.id, document=open(out_zip, "rb"))
 
 
 @router.message(F.text == "/support_cancel")
@@ -1838,6 +2009,39 @@ async def cmd_stats(message: Message):
     )
 
 
+@router.message(F.text == "/analytics")
+async def cmd_analytics(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    apps = get_counts_by_day("applications", 7)
+    tickets = get_counts_by_day("support_sessions", 7)
+    avg_decision = format_duration(get_avg_decision_time_seconds())
+    avg_first_reply = format_duration(get_avg_first_admin_reply_seconds())
+    pending_old = get_pending_older_than(PENDING_REMINDER_SECONDS)
+    stale_tickets = get_stale_tickets(TICKET_REMINDER_SECONDS)
+    admin_stats = get_admin_decision_stats(5)
+
+    lines = [fmt_header("Аналитика")]
+    lines.append(fmt_section("Скорость", "\n".join([
+        f"Среднее решение заявки: {avg_decision}",
+        f"Первый ответ в тикете: {avg_first_reply}",
+    ])))
+    lines.append(fmt_section("Нагрузка", "\n".join([
+        f"Заявок без ответа > {PENDING_REMINDER_SECONDS // 3600}ч: {pending_old}",
+        f"Тикетов без ответа > {TICKET_REMINDER_SECONDS // 3600}ч: {stale_tickets}",
+    ])))
+    lines.append(fmt_section("Заявки (7 дней)", "—" if not apps else "\n".join([f"{d}: {c}" for d, c in apps])))
+    lines.append(fmt_section("Тикеты (7 дней)", "—" if not tickets else "\n".join([f"{d}: {c}" for d, c in tickets])))
+    if admin_stats:
+        admin_lines = []
+        for admin_id, admin_username, cnt in admin_stats:
+            tag = f"@{admin_username}" if admin_username else f"id {admin_id}"
+            admin_lines.append(f"{tag}: {cnt}")
+        lines.append(fmt_section("Админ‑активность (топ 5)", "\n".join(admin_lines)))
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 @router.message(F.text == "/archive")
 async def cmd_archive(message: Message):
     if not is_admin(message.from_user.id):
@@ -1953,6 +2157,39 @@ async def cmd_admin(message: Message):
         await message.answer("Нет прав.")
         return
     await message.answer("🛠️ *Админ панель*", parse_mode=ParseMode.MARKDOWN, reply_markup=build_admin_panel())
+
+
+@router.message(F.text == "/add_admin")
+async def cmd_add_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /add_admin <tg_id>")
+        return
+    new_id = int(parts[1])
+    ADMIN_IDS.add(new_id)
+    save_config_updates({"admin_ids": sorted(ADMIN_IDS)})
+    await message.answer(f"Админ добавлен: {new_id}")
+
+
+@router.message(F.text == "/remove_admin")
+async def cmd_remove_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /remove_admin <tg_id>")
+        return
+    rm_id = int(parts[1])
+    if rm_id == message.from_user.id:
+        await message.answer("Нельзя удалить самого себя.")
+        return
+    ADMIN_IDS.discard(rm_id)
+    save_config_updates({"admin_ids": sorted(ADMIN_IDS)})
+    await message.answer(f"Админ удалён: {rm_id}")
 
 
 @router.my_chat_member()
@@ -2151,6 +2388,9 @@ async def on_text(message: Message, bot: Bot):
             if not text:
                 await message.answer(f"{fmt_header('Техподдержка')}\nТема не может быть пустой. Попробуй ещё раз.", parse_mode=ParseMode.MARKDOWN)
                 return
+            if contains_profanity(text):
+                await message.answer(f"{fmt_header('Техподдержка')}\nПожалуйста, без оскорблений.", parse_mode=ParseMode.MARKDOWN)
+                return
             draft = TICKET_DRAFT_BY_USER.get(user_id, {})
             draft["subject"] = text
             TICKET_DRAFT_BY_USER[user_id] = draft
@@ -2160,6 +2400,9 @@ async def on_text(message: Message, bot: Bot):
         if mode == "ticket_body":
             if not text:
                 await message.answer(f"{fmt_header('Техподдержка')}\nСообщение пустое. Попробуй ещё раз.", parse_mode=ParseMode.MARKDOWN)
+                return
+            if contains_profanity(text):
+                await message.answer(f"{fmt_header('Техподдержка')}\nПожалуйста, без оскорблений.", parse_mode=ParseMode.MARKDOWN)
                 return
             draft = TICKET_DRAFT_BY_USER.pop(user_id, {})
             subject = draft.get("subject") or "Без темы"
@@ -2187,6 +2430,9 @@ async def on_text(message: Message, bot: Bot):
             if not text:
                 await message.answer("Сообщение пустое.")
                 return
+            if contains_profanity(text):
+                await message.answer("Пожалуйста, без оскорблений.")
+                return
             add_ticket_message(ticket_id, "admin_text", text, None, None)
             await message.answer(f"{fmt_header('Ответ отправлен')}\nID: `#{ticket_id}`", parse_mode=ParseMode.MARKDOWN)
             ticket = get_ticket(ticket_id)
@@ -2209,6 +2455,9 @@ async def on_text(message: Message, bot: Bot):
                 return
             if not text:
                 await message.answer("Сообщение пустое.")
+                return
+            if contains_profanity(text):
+                await message.answer("Пожалуйста, без оскорблений.")
                 return
             add_ticket_message(ticket_id, "user_text", text, None, None)
             await message.answer(f"{fmt_header('Сообщение добавлено')}\nID: `#{ticket_id}`", parse_mode=ParseMode.MARKDOWN)
@@ -2248,6 +2497,9 @@ async def on_text(message: Message, bot: Bot):
         if mode == "feedback_text":
             if text == BTN_SKIP:
                 text = ""
+            if text and contains_profanity(text):
+                await message.answer("Пожалуйста, без оскорблений.")
+                return
             draft = FEEDBACK_DRAFT_BY_USER.pop(user_id, {})
             kind = "feedback"
             target = draft.get("target") or "server"
@@ -2372,6 +2624,9 @@ async def on_text(message: Message, bot: Bot):
     step, _data, _editing_app_id = state
     key, _title, _hint = QUESTIONS[step]
     text = (message.text or "").strip()
+    if contains_profanity(text):
+        await message.answer("Пожалуйста, без оскорблений.")
+        return
 
     if key == "nick" and (len(text) < 3 or len(text) > 16):
         await message.answer("Ник должен быть 3-16 символов.")
@@ -2481,6 +2736,7 @@ async def on_callback(call: CallbackQuery, bot: Bot):
     data = call.data or ""
     user_id = call.from_user.id
     maybe_cleanup()
+    await maybe_send_reminders(bot)
 
     if data == "cancel_form":
         state = load_form_state(user_id)
@@ -2989,6 +3245,10 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await bot.send_message(call.message.chat.id, "Введите поиск (ник, @username или id):")
         elif action == "stats":
             await cmd_stats(call.message)
+        elif action == "analytics":
+            await cmd_analytics(call.message)
+        elif action == "export":
+            await cmd_export(call.message, bot)
         elif action == "tickets":
             await send_ticket_list(bot, call.message.chat.id, 1, for_admin=True)
         elif action == "ticket_search":
