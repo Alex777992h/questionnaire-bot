@@ -1508,11 +1508,18 @@ async def cmd_start(message: Message):
     if payload == "apply":
         await cmd_apply(message, message.bot)
         return
+    rules_text = (
+        "• Пиши честно и по делу\n"
+        "• Не флуди и не отправляй дубликаты\n"
+        "• Без оскорблений и мата\n"
+        "• Ник: латиница, цифры и `_` (3–16)"
+    )
+    commands_text = "`/apply` — подать заявку\n`/status` — статус заявки"
     text = (
         f"{fmt_header(BRAND)}\n"
         "👋 Привет! Я помогу подать заявку и следить за её статусом.\n"
-        f"{fmt_section('Правила бота', '• Пиши честно и по делу\\n• Не флуди и не отправляй дубликаты\\n• Без оскорблений и мата\\n• Ник: латиница, цифры и `_` (3–16)')}\n"
-        f"{fmt_section('Быстрые команды', '`/apply` — подать заявку\\n`/status` — статус заявки')}"
+        f"{fmt_section('Правила бота', rules_text)}\n"
+        f"{fmt_section('Быстрые команды', commands_text)}"
     )
     if is_admin(message.from_user.id):
         text += "\n`/admin` — админ панель"
@@ -1527,14 +1534,38 @@ async def cmd_start(message: Message):
 
 @router.message(F.text == "/help")
 async def cmd_help(message: Message):
-    await message.answer(
-        f"{fmt_header('Справка ' + BRAND)}\n"
-        f"{fmt_section('Основные', '`/apply` — подать заявку\\n`/status` — статус заявки\\n`/cancel` — отменить анкету\\n`/edit` — редактировать активную заявку')}\n"
-        f"{fmt_section('Поддержка', '`/support` — техподдержка (тикеты)\\n`/my_tickets` — мои тикеты\\n`/feedback` — оставить отзыв')}\n"
-        f"{fmt_section('Админ', '`/admin` — админ панель\\n`/analytics` — аналитика\\n`/export` — экспорт CSV\\n`/tickets` — тикеты\\n`/ticket_search` — поиск тикетов\\n`/ban_user <tg_id>` — бан TG\\n`/unban_user <tg_id>` — разбан TG\\n`/ban_nick <nick>` — бан ника\\n`/unban_nick <nick>` — разбан ника\\n`/archive` — архивировать старые заявки')}"
-        + (f"\n\n🔗 Быстрая заявка: `{APPLY_DEEPLINK}`" if APPLY_DEEPLINK else ""),
-        parse_mode=ParseMode.MARKDOWN,
+    base_section = (
+        "`/apply` — подать заявку\n"
+        "`/status` — статус заявки\n"
+        "`/cancel` — отменить анкету\n"
+        "`/edit` — редактировать активную заявку"
     )
+    support_section = (
+        "`/support` — техподдержка (тикеты)\n"
+        "`/my_tickets` — мои тикеты\n"
+        "`/feedback` — оставить отзыв"
+    )
+    admin_section = (
+        "`/admin` — админ панель\n"
+        "`/analytics` — аналитика\n"
+        "`/export` — экспорт CSV\n"
+        "`/tickets` — тикеты\n"
+        "`/ticket_search` — поиск тикетов\n"
+        "`/ban_user <tg_id>` — бан TG\n"
+        "`/unban_user <tg_id>` — разбан TG\n"
+        "`/ban_nick <nick>` — бан ника\n"
+        "`/unban_nick <nick>` — разбан ника\n"
+        "`/archive` — архивировать старые заявки"
+    )
+    text = (
+        f"{fmt_header('Справка ' + BRAND)}\n"
+        f"{fmt_section('Основные', base_section)}\n"
+        f"{fmt_section('Поддержка', support_section)}\n"
+        f"{fmt_section('Админ', admin_section)}"
+    )
+    if APPLY_DEEPLINK:
+        text += f"\n\n🔗 Быстрая заявка: `{APPLY_DEEPLINK}`"
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 
 @router.message(F.text == "/apply")
