@@ -1134,12 +1134,18 @@ def build_admin_panel() -> InlineKeyboardMarkup:
             make_button("🔎 По ID", "admin:show"),
         ],
         [
+            make_button("🧭 Дашборд", "admin:dashboard"),
+        ],
+        [
             make_button("🔍 Поиск", "admin:search"),
             make_button("📊 Статистика", "admin:stats"),
         ],
         [
             make_button("📈 Аналитика", "admin:analytics"),
             make_button("📦 Экспорт", "admin:export"),
+        ],
+        [
+            make_button("🗂️ Бэкап", "admin:backup"),
         ],
         [
             make_button("📮 Тикеты", "admin:tickets"),
@@ -1158,6 +1164,10 @@ def build_admin_panel() -> InlineKeyboardMarkup:
         [
             make_button("🚫 Бан ник", "admin:ban_nick"),
             make_button("✅ Разбан ник", "admin:unban_nick"),
+        ],
+        [
+            make_button("➕ Админ", "admin:add_admin"),
+            make_button("➖ Админ", "admin:remove_admin"),
         ],
         [
             make_button("📦 Архив", "admin:archive"),
@@ -1471,6 +1481,27 @@ async def send_ticket_view(bot: Bot, chat_id: int, ticket_id: int, for_admin: bo
     await bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
+async def send_admin_dashboard(bot: Bot, chat_id: int):
+    s = get_stats()
+    pending_old = get_pending_older_than(PENDING_REMINDER_SECONDS)
+    stale_tickets = get_stale_tickets(TICKET_REMINDER_SECONDS)
+    avg_decision = format_duration(get_avg_decision_time_seconds())
+    avg_first_reply = format_duration(get_avg_first_admin_reply_seconds())
+    app_line = f"{s['total']} / {s['pending']} / {s['approved']}"
+    avg_rating_line = f"{s['avg_rating']:.2f}⭐"
+    text = (
+        f"{fmt_header('Дашборд администрации')}\n"
+        f"{fmt_kv('Заявки: всего/ожидают/одобрено', app_line)}\n"
+        f"{fmt_kv('Тикеты: активные', str(get_ticket_count('open')))}\n"
+        f"{fmt_kv('Старые заявки > {PENDING_REMINDER_SECONDS // 3600}ч', str(pending_old))}\n"
+        f"{fmt_kv('Тикеты без ответа > {TICKET_REMINDER_SECONDS // 3600}ч', str(stale_tickets))}\n"
+        f"{fmt_kv('Среднее решение заявки', avg_decision)}\n"
+        f"{fmt_kv('Первый ответ в тикете', avg_first_reply)}\n"
+        f"{fmt_kv('Средняя оценка бота', avg_rating_line)}"
+    )
+    await bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
+
+
 async def send_ticket_list(bot: Bot, chat_id: int, page: int, for_admin: bool, user_id: Optional[int] = None):
     page = max(1, page)
     offset = (page - 1) * TICKETS_PAGE_SIZE
@@ -1547,8 +1578,10 @@ async def cmd_help(message: Message):
     )
     admin_section = (
         "`/admin` — админ панель\n"
+        "`/dashboard` — дашборд\n"
         "`/analytics` — аналитика\n"
         "`/export` — экспорт CSV\n"
+        "`/backup` — бэкап (config + db)\n"
         "`/tickets` — тикеты\n"
         "`/ticket_search` — поиск тикетов\n"
         "`/ban_user <tg_id>` — бан TG\n"
@@ -1817,6 +1850,21 @@ async def cmd_export(message: Message, bot: Bot):
     await bot.send_document(message.chat.id, document=open(out_zip, "rb"))
 
 
+@router.message(F.text == "/backup")
+async def cmd_backup(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_zip = f"backup_{ts}.zip"
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.exists(DB_PATH):
+            zf.write(DB_PATH, arcname="bot.db")
+        if os.path.exists(CONFIG_PATH):
+            zf.write(CONFIG_PATH, arcname="config.json")
+    await bot.send_document(message.chat.id, document=open(out_zip, "rb"))
+
+
 @router.message(F.text == "/support_cancel")
 async def cmd_support_cancel(message: Message):
     if message.from_user.id in PENDING_INPUT_MODE:
@@ -2071,6 +2119,14 @@ async def cmd_analytics(message: Message):
             admin_lines.append(f"{tag}: {cnt}")
         lines.append(fmt_section("Админ‑активность (топ 5)", "\n".join(admin_lines)))
     await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(F.text == "/dashboard")
+async def cmd_dashboard(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    await send_admin_dashboard(bot, message.chat.id)
 
 
 @router.message(F.text == "/archive")
@@ -2447,6 +2503,18 @@ async def on_text(message: Message, bot: Bot):
                 inline_keyboard=[[make_button("Открыть тикет", f"ticket_admin_view:{ticket_id}")]]
             )
             await notify_admins(bot, f"🆕 Новый тикет `#{ticket_id}` ({BRAND})", admin_kb)
+            try:
+                await bot.send_message(
+                    message.chat.id,
+                    f"{fmt_header('Подсказка')}\n"
+                    "Если можешь — добавь:\n"
+                    "• версию Minecraft\n"
+                    "• когда началась проблема\n"
+                    "• скрин/видео (если есть)",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
             return
         if mode.startswith("ticket_reply:"):
             try:
@@ -2646,6 +2714,27 @@ async def on_text(message: Message, bot: Bot):
                 who = f"@{username}" if username else f"id {uid}"
                 lines.append(f"#{tid} — {topic_label} — {subject or '—'} — {who} — {status}")
             await message.answer("\n".join(lines))
+            return
+        if mode == "add_admin":
+            if not text.isdigit():
+                await message.answer("Нужен числовой Telegram ID.")
+                return
+            new_id = int(text)
+            ADMIN_IDS.add(new_id)
+            save_config_updates({"admin_ids": sorted(ADMIN_IDS)})
+            await message.answer(f"Админ добавлен: {new_id}")
+            return
+        if mode == "remove_admin":
+            if not text.isdigit():
+                await message.answer("Нужен числовой Telegram ID.")
+                return
+            rm_id = int(text)
+            if rm_id == message.from_user.id:
+                await message.answer("Нельзя удалить самого себя.")
+                return
+            ADMIN_IDS.discard(rm_id)
+            save_config_updates({"admin_ids": sorted(ADMIN_IDS)})
+            await message.answer(f"Админ удалён: {rm_id}")
             return
 
     state = load_form_state(user_id)
@@ -3280,6 +3369,10 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await cmd_analytics(call.message)
         elif action == "export":
             await cmd_export(call.message, bot)
+        elif action == "backup":
+            await cmd_backup(call.message, bot)
+        elif action == "dashboard":
+            await send_admin_dashboard(bot, call.message.chat.id)
         elif action == "tickets":
             await send_ticket_list(bot, call.message.chat.id, 1, for_admin=True)
         elif action == "ticket_search":
@@ -3287,6 +3380,12 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await bot.send_message(call.message.chat.id, "🔎 Введи поиск по тикетам (тема, @username или id):")
         elif action == "health":
             await cmd_health(call.message)
+        elif action == "add_admin":
+            PENDING_INPUT_MODE[user_id] = "add_admin"
+            await bot.send_message(call.message.chat.id, "Введи Telegram ID для добавления администратора:")
+        elif action == "remove_admin":
+            PENDING_INPUT_MODE[user_id] = "remove_admin"
+            await bot.send_message(call.message.chat.id, "Введи Telegram ID для удаления администратора:")
         elif action == "ban_user":
             PENDING_INPUT_MODE[user_id] = "ban_user"
             await bot.send_message(call.message.chat.id, "Введите Telegram ID для бана:")
