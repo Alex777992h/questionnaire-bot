@@ -23,6 +23,7 @@
   "tickets_page_size": 5,
   "bot_username": "infinitycraftmembers_bot",
   "group_chat_ids": [],
+  "disable_config_write": true,
   "enable_button_style": false,
   "support_chat": "https://t.me/+15HwEq4ltUJmMTIy"
 }

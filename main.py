@@ -6,6 +6,7 @@ import sqlite3
 import logging
 import csv
 import zipfile
+import urllib.request
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
 
@@ -62,16 +63,39 @@ DEFAULT_CONFIG = {
     "pending_reminder_hours": 24,
     "ticket_reminder_hours": 24,
     "profanity_words": ["мат", "хуй", "пизд", "еб", "сука", "бля"],
+    "disable_config_write": False,
 }
 
 CONFIG_PATH = "config.json"
-if os.path.exists(CONFIG_PATH):
+CONFIG_URL = os.getenv("CONFIG_URL", "").strip()
+
+def load_remote_config(url: str) -> Optional[dict]:
+    if not url:
+        return None
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            user_cfg = json.load(f)
-        DEFAULT_CONFIG.update(user_cfg)
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = resp.read().decode("utf-8")
+        return json.loads(data)
     except Exception:
-        pass
+        return None
+
+def load_local_config(path: str) -> Optional[dict]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+if os.path.exists(CONFIG_PATH):
+    user_cfg = load_local_config(CONFIG_PATH)
+    if user_cfg:
+        DEFAULT_CONFIG.update(user_cfg)
+
+remote_cfg = load_remote_config(CONFIG_URL)
+if remote_cfg:
+    DEFAULT_CONFIG.update(remote_cfg)
 
 ADMIN_IDS = set(DEFAULT_CONFIG["admin_ids"])
 BAN_USER_IDS = set(DEFAULT_CONFIG["banned_user_ids"])
@@ -99,6 +123,9 @@ REMINDER_INTERVAL_SECONDS = int(DEFAULT_CONFIG.get("reminder_interval_minutes", 
 PENDING_REMINDER_SECONDS = int(DEFAULT_CONFIG.get("pending_reminder_hours", 24)) * 3600
 TICKET_REMINDER_SECONDS = int(DEFAULT_CONFIG.get("ticket_reminder_hours", 24)) * 3600
 PROFANITY_WORDS = [w.lower() for w in DEFAULT_CONFIG.get("profanity_words", [])]
+DISABLE_CONFIG_WRITE = bool(DEFAULT_CONFIG.get("disable_config_write", False))
+if CONFIG_URL:
+    DISABLE_CONFIG_WRITE = True
 
 # === DB PATH ===
 if os.path.exists("/app/data/"):
@@ -134,6 +161,7 @@ BTN_APPLY = "📝 Подать заявку"
 BTN_STATUS = "📌 Статус заявки"
 BTN_ADMIN = "🛠️ Админ панель"
 BTN_ACCOUNTS = "👥 Аккаунты"
+BTN_PROFILE = "👤 Профиль"
 BTN_PENDING = "🧾 Активные заявки"
 BTN_SHOW = "🔎 Показать по ID"
 BTN_SEARCH = "🔍 Поиск"
@@ -145,12 +173,19 @@ BTN_BAN_NICK = "🚫 Бан ник"
 BTN_UNBAN_NICK = "✅ Разбан ник"
 BTN_ARCHIVE = "📦 Архив"
 BTN_HELP = "ℹ️ Помощь"
+BTN_REVIEWS = "⭐ Отзывы"
+BTN_REVIEWS_SERVER = "🌍 Отзывы: сервер"
+BTN_REVIEWS_BOT = "🤖 Отзывы: бот"
+BTN_FAQ = "❓ FAQ"
 BTN_BACK = "⬅️ Назад"
 BTN_SUPPORT = "🛟 Техподдержка"
 BTN_FEEDBACK = "💬 Отзыв"
+BTN_MY_TICKETS = "🧾 Мои тикеты"
 BTN_SUPPORT_DONE = "✅ Отправить"
 BTN_SUPPORT_CANCEL = "❌ Отменить"
 BTN_CANCEL = "❌ Отменить"
+BTN_HOME = "🏠 Главное меню"
+BTN_FORM_HELP = "ℹ️ Что дальше?"
 BTN_SKIP = "⏭️ Пропустить"
 
 TICKET_TOPICS = [
@@ -175,6 +210,31 @@ def fmt_section(title: str, body: str) -> str:
 
 def fmt_kv(label: str, value: str) -> str:
     return f"{label}: {value}"
+
+
+def fmt_hint(text: str) -> str:
+    return f"ℹ️ {text}"
+
+
+FAQ_ITEMS = [
+    ("faq_apply", "Как подать заявку?", "Нажми «Подать заявку» и ответь на вопросы по порядку."),
+    ("faq_status", "Где посмотреть статус?", "Нажми «Статус заявки» — увидишь последний статус."),
+    ("faq_edit", "Можно ли исправить заявку?", "Да. Открой «Статус заявки» и нажми «Редактировать»."),
+    ("faq_cooldown", "Когда можно подать повторно?", "После решения заявки действует небольшой таймаут."),
+    ("faq_wait", "Сколько ждать решения?", "Зависит от админов. Обычно решение приходит в течение суток."),
+    ("faq_nick", "Какие правила для ника?", "Ник: латиница, цифры и _ (3–16 символов)."),
+    ("faq_accounts", "Как добавить второй ник?", "Открой «Аккаунты» → «Добавить ник». Максимум 2 аккаунта."),
+    ("faq_remove_account", "Как удалить ник?", "Открой «Аккаунты» → выбери ник → «Удалить»."),
+    ("faq_support", "Как написать в поддержку?", "Открой «Техподдержка» → «Создать обращение»."),
+    ("faq_tickets", "Где мои тикеты?", "Открой «Техподдержка» → «Мои тикеты»."),
+    ("faq_ticket_close", "Как закрыть тикет?", "Внутри тикета нажми «Закрыть»."),
+    ("faq_reviews", "Где смотреть отзывы?", "Нажми «Отзывы» и выбери раздел."),
+    ("faq_feedback", "Как оставить отзыв?", "Нажми «Отзыв» и выбери тему/оценку."),
+    ("faq_cancel", "Как отменить действие?", "Нажми «Отмена» или введи /cancel."),
+    ("faq_rules", "Почему отказали?", "Админ может указать причину — она придёт в сообщении."),
+    ("faq_group", "Где ссылка на чат?", "После одобрения приходит ссылка на чат и IP сервера."),
+    ("faq_bot", "Бот не отвечает", "Проверь интернет и попробуй снова. Если не помогает — поддержка."),
+]
 
 LAST_PLUGIN_ALERT_TS = 0
 LAST_CLEANUP_TS = 0
@@ -222,6 +282,10 @@ def db_connect() -> sqlite3.Connection:
             kind TEXT NOT NULL,
             target TEXT,
             rating INTEGER,
+            status TEXT DEFAULT 'visible',
+            admin_reply TEXT,
+            replied_by INTEGER,
+            replied_at INTEGER,
             message TEXT NOT NULL,
             created_at INTEGER NOT NULL
         )
@@ -339,6 +403,8 @@ def save_config_group_ids():
 
 
 def save_config_updates(updates: dict):
+    if DISABLE_CONFIG_WRITE:
+        return
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -382,6 +448,26 @@ def ensure_columns(conn: sqlite3.Connection):
     if "rating" not in fb_existing:
         try:
             conn.execute("ALTER TABLE feedback ADD COLUMN rating INTEGER")
+        except sqlite3.Error:
+            pass
+    if "status" not in fb_existing:
+        try:
+            conn.execute("ALTER TABLE feedback ADD COLUMN status TEXT DEFAULT 'visible'")
+        except sqlite3.Error:
+            pass
+    if "admin_reply" not in fb_existing:
+        try:
+            conn.execute("ALTER TABLE feedback ADD COLUMN admin_reply TEXT")
+        except sqlite3.Error:
+            pass
+    if "replied_by" not in fb_existing:
+        try:
+            conn.execute("ALTER TABLE feedback ADD COLUMN replied_by INTEGER")
+        except sqlite3.Error:
+            pass
+    if "replied_at" not in fb_existing:
+        try:
+            conn.execute("ALTER TABLE feedback ADD COLUMN replied_at INTEGER")
         except sqlite3.Error:
             pass
     cur.execute("PRAGMA table_info(user_accounts)")
@@ -734,6 +820,12 @@ def get_stats() -> Dict[str, int]:
         cur.execute("SELECT AVG(rating) FROM feedback WHERE kind = 'bot_rating'")
         avg_rating_row = cur.fetchone()
         avg_rating = float(avg_rating_row[0]) if avg_rating_row and avg_rating_row[0] is not None else 0.0
+        cur.execute("SELECT AVG(rating) FROM feedback WHERE kind = 'feedback' AND target = 'server' AND status = 'visible'")
+        avg_server_row = cur.fetchone()
+        avg_server = float(avg_server_row[0]) if avg_server_row and avg_server_row[0] is not None else 0.0
+        cur.execute("SELECT AVG(rating) FROM feedback WHERE kind = 'feedback' AND target = 'bot' AND status = 'visible'")
+        avg_bot_row = cur.fetchone()
+        avg_bot = float(avg_bot_row[0]) if avg_bot_row and avg_bot_row[0] is not None else 0.0
     return {
         "total": total,
         "pending": pending,
@@ -741,6 +833,8 @@ def get_stats() -> Dict[str, int]:
         "rejected": rejected,
         "archived": archived,
         "avg_rating": avg_rating,
+        "avg_server_rating": avg_server,
+        "avg_bot_rating": avg_bot,
     }
 
 
@@ -912,6 +1006,70 @@ def get_ticket_count(status: Optional[str] = None) -> int:
         return cur.fetchone()[0]
 
 
+def list_feedback(target: Optional[str], limit: int, offset: int) -> List[tuple]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        if target:
+            cur.execute(
+                "SELECT id, user_id, username, target, rating, message, admin_reply, created_at "
+                "FROM feedback WHERE kind = 'feedback' AND status = 'visible' AND target = ? "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                (target, limit, offset),
+            )
+        else:
+            cur.execute(
+                "SELECT id, user_id, username, target, rating, message, admin_reply, created_at "
+                "FROM feedback WHERE kind = 'feedback' AND status = 'visible' "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        return cur.fetchall()
+
+
+def count_feedback(target: Optional[str]) -> int:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        if target:
+            cur.execute(
+                "SELECT COUNT(*) FROM feedback WHERE kind = 'feedback' AND status = 'visible' AND target = ?",
+                (target,),
+            )
+        else:
+            cur.execute(
+                "SELECT COUNT(*) FROM feedback WHERE kind = 'feedback' AND status = 'visible'"
+            )
+        return cur.fetchone()[0]
+
+
+def get_feedback(feedback_id: int) -> Optional[tuple]:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, user_id, username, target, rating, message, admin_reply, status, created_at "
+            "FROM feedback WHERE id = ?",
+            (feedback_id,),
+        )
+        return cur.fetchone()
+
+
+def set_feedback_status(feedback_id: int, status: str):
+    with db_connect() as conn:
+        conn.execute("UPDATE feedback SET status = ? WHERE id = ?", (status, feedback_id))
+
+
+def delete_feedback(feedback_id: int):
+    with db_connect() as conn:
+        conn.execute("DELETE FROM feedback WHERE id = ?", (feedback_id,))
+
+
+def set_feedback_reply(feedback_id: int, reply: str, admin_id: int):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE feedback SET admin_reply = ?, replied_by = ?, replied_at = ? WHERE id = ?",
+            (reply, admin_id, int(time.time()), feedback_id),
+        )
+
+
 def get_pending_older_than(seconds: int) -> int:
     cutoff = int(time.time()) - seconds
     with db_connect() as conn:
@@ -1035,6 +1193,58 @@ def build_accounts_panel(nicks: List[str], primary: Optional[str]) -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def reset_pending(user_id: int):
+    PENDING_INPUT_MODE.pop(user_id, None)
+    TICKET_DRAFT_BY_USER.pop(user_id, None)
+    FEEDBACK_DRAFT_BY_USER.pop(user_id, None)
+
+
+def cancel_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_CANCEL), KeyboardButton(text=BTN_HOME)]],
+        resize_keyboard=True,
+    )
+
+
+async def send_reviews(message: Message, target: Optional[str], page: int):
+    page = max(1, page)
+    limit = 5
+    offset = (page - 1) * limit
+    total = count_feedback(target)
+    rows = list_feedback(target, limit, offset)
+    if not rows:
+        await message.answer(f"{fmt_header('Отзывы')}\nПока нет отзывов.", parse_mode=ParseMode.MARKDOWN)
+        return
+    avg_server = get_stats()["avg_server_rating"]
+    avg_bot = get_stats()["avg_bot_rating"]
+    header = (
+        f"{fmt_header('Отзывы')}\n"
+        f"{fmt_kv('Средняя оценка сервера', f'{avg_server:.2f}⭐')}\n"
+        f"{fmt_kv('Средняя оценка бота', f'{avg_bot:.2f}⭐')}\n"
+        f"{fmt_kv('Страница', str(page))}\n"
+        f"{fmt_hint('Листай отзывы кнопками ниже')}"
+    )
+    lines = [header]
+    for fid, user_id, username, ftarget, rating, msg, admin_reply, created_at in rows:
+        who = f"@{username}" if username else f"id {user_id}"
+        stars = "⭐" * (rating or 0) if rating else "—"
+        lines.append(
+            f"\n{ACCENT_LINE}\n"
+            f"#{fid} • {('сервер' if ftarget=='server' else 'бот')} • {stars}\n"
+            f"{who} • {format_date(created_at)}\n"
+            f"{msg}"
+        )
+        if admin_reply:
+            lines.append(f"↪ Ответ админа: {admin_reply}")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [make_button("🌍 Сервер", "reviews:server:1"), make_button("🤖 Бот", "reviews:bot:1")],
+            [make_button("⬅️", f"reviews:{target or 'all'}:{page-1}"), make_button("➡️", f"reviews:{target or 'all'}:{page+1}")]
+        ]
+    )
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
 def archive_old_applications(days: int) -> int:
     cutoff = int(time.time()) - days * 86400
     with db_connect() as conn:
@@ -1118,13 +1328,31 @@ def contains_profanity(text: str) -> bool:
 def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text=BTN_APPLY), KeyboardButton(text=BTN_STATUS)],
-        [KeyboardButton(text=BTN_ACCOUNTS)],
+        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_ACCOUNTS)],
         [KeyboardButton(text=BTN_SUPPORT), KeyboardButton(text=BTN_FEEDBACK)],
-        [KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_REVIEWS), KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_FAQ)],
     ]
     if is_admin(user_id):
         keyboard.append([KeyboardButton(text=BTN_ADMIN)])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def build_faq_menu_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for faq_id, title, _answer in FAQ_ITEMS:
+        rows.append([make_button(title, f"faq:{faq_id}")])
+    rows.append([make_button("🏠 Главное меню", "faq:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_faq_answer_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [make_button("⬅️ Назад", "faq:menu")],
+            [make_button("🏠 Главное меню", "faq:home")],
+        ]
+    )
 
 
 def build_admin_panel() -> InlineKeyboardMarkup:
@@ -1146,6 +1374,9 @@ def build_admin_panel() -> InlineKeyboardMarkup:
         ],
         [
             make_button("🗂️ Бэкап", "admin:backup"),
+        ],
+        [
+            make_button("⭐ Отзывы", "admin:reviews"),
         ],
         [
             make_button("📮 Тикеты", "admin:tickets"),
@@ -1192,9 +1423,10 @@ def ask_question(chat_id: int, index: int):
                 make_button("❌ Нет", f"ans:{key}:no", style="negative"),
             ]
         )
+    buttons.append([make_button(BTN_FORM_HELP, "form_help")])
     buttons.append([make_button("⛔ Отменить", "cancel_form")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    text = f"🧩 *{title}*\n_{hint}_"
+    text = f"🧩 *{title}*\n_{hint}_\n\nВопрос {index + 1} из {len(QUESTIONS)}"
     return keyboard, text
 
 
@@ -1478,6 +1710,7 @@ async def send_ticket_view(bot: Bot, chat_id: int, ticket_id: int, for_admin: bo
             content = text or f"[файл: {_file_type or 'media'}]"
             lines.append(f"{who} {format_date(ts)} — {content}")
     keyboard = build_ticket_admin_keyboard(ticket_id, status) if for_admin else build_ticket_user_keyboard(ticket_id, status)
+    lines.append(fmt_hint("Ответить можно кнопкой ниже"))
     await bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
@@ -1489,12 +1722,14 @@ async def send_admin_dashboard(bot: Bot, chat_id: int):
     avg_first_reply = format_duration(get_avg_first_admin_reply_seconds())
     app_line = f"{s['total']} / {s['pending']} / {s['approved']}"
     avg_rating_line = f"{s['avg_rating']:.2f}⭐"
+    pending_label = f"Старые заявки > {PENDING_REMINDER_SECONDS // 3600}ч"
+    ticket_label = f"Тикеты без ответа > {TICKET_REMINDER_SECONDS // 3600}ч"
     text = (
         f"{fmt_header('Дашборд администрации')}\n"
         f"{fmt_kv('Заявки: всего/ожидают/одобрено', app_line)}\n"
         f"{fmt_kv('Тикеты: активные', str(get_ticket_count('open')))}\n"
-        f"{fmt_kv('Старые заявки > {PENDING_REMINDER_SECONDS // 3600}ч', str(pending_old))}\n"
-        f"{fmt_kv('Тикеты без ответа > {TICKET_REMINDER_SECONDS // 3600}ч', str(stale_tickets))}\n"
+        f"{fmt_kv(pending_label, str(pending_old))}\n"
+        f"{fmt_kv(ticket_label, str(stale_tickets))}\n"
         f"{fmt_kv('Среднее решение заявки', avg_decision)}\n"
         f"{fmt_kv('Первый ответ в тикете', avg_first_reply)}\n"
         f"{fmt_kv('Средняя оценка бота', avg_rating_line)}"
@@ -1514,7 +1749,7 @@ async def send_ticket_list(bot: Bot, chat_id: int, page: int, for_admin: bool, u
     if not rows:
         await bot.send_message(chat_id, "Тикетов пока нет.")
         return
-    lines = [f"📮 *Тикеты {BRAND}* (страница {page})", ACCENT_LINE]
+    lines = [f"📮 *Тикеты {BRAND}* (страница {page})", ACCENT_LINE, fmt_hint("Открой тикет кнопкой ниже")]
     buttons = []
     for tid, uid, username, topic, subject, status, created_at, updated_at in rows:
         subject_short = (subject or "Без темы")[:24]
@@ -1550,7 +1785,8 @@ async def cmd_start(message: Message):
         f"{fmt_header(BRAND)}\n"
         "👋 Привет! Я помогу подать заявку и следить за её статусом.\n"
         f"{fmt_section('Правила бота', rules_text)}\n"
-        f"{fmt_section('Быстрые команды', commands_text)}"
+        f"{fmt_section('Быстрый старт', 'Нажми кнопку внизу и следуй шагам.')} \n"
+        f"{fmt_section('Команды', commands_text)}"
     )
     if is_admin(message.from_user.id):
         text += "\n`/admin` — админ панель"
@@ -1574,7 +1810,9 @@ async def cmd_help(message: Message):
     support_section = (
         "`/support` — техподдержка (тикеты)\n"
         "`/my_tickets` — мои тикеты\n"
-        "`/feedback` — оставить отзыв"
+        "`/feedback` — оставить отзыв\n"
+        "`/reviews` — отзывы\n"
+        "`/faq` — быстрые ответы"
     )
     admin_section = (
         "`/admin` — админ панель\n"
@@ -1584,6 +1822,8 @@ async def cmd_help(message: Message):
         "`/backup` — бэкап (config + db)\n"
         "`/tickets` — тикеты\n"
         "`/ticket_search` — поиск тикетов\n"
+        "`/review_admin` — управление отзывами\n"
+        "`/reviews` — публичные отзывы\n"
         "`/ban_user <tg_id>` — бан TG\n"
         "`/unban_user <tg_id>` — разбан TG\n"
         "`/ban_nick <nick>` — бан ника\n"
@@ -1601,10 +1841,18 @@ async def cmd_help(message: Message):
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 
+@router.message(F.text == "/faq")
+async def cmd_faq(message: Message):
+    reset_pending(message.from_user.id)
+    text = f"{fmt_header('FAQ ' + BRAND)}\nВыбери вопрос:"
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_faq_menu_kb())
+
+
 @router.message(F.text == "/apply")
 async def cmd_apply(message: Message, bot: Bot):
     maybe_cleanup()
     await maybe_send_reminders(bot)
+    reset_pending(message.from_user.id)
     if is_rate_limited(message.from_user.id, "apply", RATE_LIMIT_SECONDS):
         await message.answer("Подожди секунду и попробуй снова.")
         return
@@ -1642,6 +1890,7 @@ async def cmd_apply(message: Message, bot: Bot):
 
 @router.message(F.text == "/edit")
 async def cmd_edit(message: Message, bot: Bot):
+    reset_pending(message.from_user.id)
     last = get_last_application(message.from_user.id)
     if not last:
         await message.answer("Нет активной заявки для редактирования.")
@@ -1670,20 +1919,54 @@ async def cmd_status(message: Message):
         return
 
     app_id, nick, status, created_at = last
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[make_button("✏️ Редактировать", "edit_request")]]
+    )
     await message.answer(
         f"{fmt_header('Статус заявки')}\n"
         f"{fmt_kv('ID', f'`#{app_id}`')}\n"
         f"{fmt_kv('Ник', f'`{nick}`')}\n"
         f"{fmt_kv('Статус', f'*{status}*')}\n"
-        f"{fmt_kv('Дата', format_date(created_at))}",
+        f"{fmt_kv('Дата', format_date(created_at))}\n"
+        f"{fmt_hint('Если статус не меняется долго — напиши в техподдержку')}",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
     )
+
+
+@router.message(F.text == "/profile")
+async def cmd_profile(message: Message):
+    user_id = message.from_user.id
+    nicks = get_user_accounts(user_id)
+    primary = get_user_selected_nick(user_id)
+    if primary not in nicks and nicks:
+        primary = nicks[0]
+        set_user_selected_nick(user_id, primary)
+    open_tickets = 0
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM support_sessions WHERE user_id = ? AND status = 'open'", (user_id,))
+        open_tickets = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM feedback WHERE user_id = ? AND kind = 'feedback'", (user_id,))
+        reviews = cur.fetchone()[0]
+    nick_lines = "\n".join([f"• `{n}`" for n in nicks]) if nicks else "—"
+    text = (
+        f"{fmt_header('Профиль')}\n"
+        f"{fmt_kv('ID', str(user_id))}\n"
+        f"{fmt_kv('Ники', '')}\n{nick_lines}\n"
+        f"{fmt_kv('Основной', primary or '—')}\n"
+        f"{fmt_kv('Открытые тикеты', str(open_tickets))}\n"
+        f"{fmt_kv('Отзывы', str(reviews))}\n"
+        f"{fmt_hint('Управляй никами через раздел «Аккаунты»')}"
+    )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 
 @router.message(F.text == "/support")
 async def cmd_support(message: Message):
     maybe_cleanup()
     await maybe_send_reminders(message.bot)
+    reset_pending(message.from_user.id)
     if is_rate_limited(message.from_user.id, "support", RATE_LIMIT_SECONDS):
         await message.answer("Подожди секунду и попробуй снова.")
         return
@@ -1749,6 +2032,7 @@ async def cmd_support(message: Message):
 async def cmd_feedback(message: Message):
     maybe_cleanup()
     await maybe_send_reminders(message.bot)
+    reset_pending(message.from_user.id)
     if is_rate_limited(message.from_user.id, "feedback", RATE_LIMIT_SECONDS):
         await message.answer("Подожди секунду и попробуй снова.")
         return
@@ -1781,11 +2065,11 @@ async def cmd_feedback(message: Message):
         inline_keyboard=[
             [make_button("🌍 Отзыв о сервере", "feedback_target:server")],
             [make_button("🤖 Отзыв о боте", "feedback_target:bot")],
+            [make_button("❌ Отмена", "cancel_any")],
         ]
     )
     await message.answer(
-        f"💬 *Отзывы {BRAND}*\n"
-        f"{ACCENT_LINE}\n"
+        f"{fmt_header('Оставить отзыв')}\n"
         "Выбери, о чём отзыв:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=keyboard,
@@ -1794,6 +2078,7 @@ async def cmd_feedback(message: Message):
 
 @router.message(F.text == "/tickets")
 async def cmd_tickets(message: Message, bot: Bot):
+    reset_pending(message.from_user.id)
     if not is_admin(message.from_user.id):
         await message.answer("Нет прав.")
         return
@@ -1802,11 +2087,12 @@ async def cmd_tickets(message: Message, bot: Bot):
 
 @router.message(F.text == "/ticket_search")
 async def cmd_ticket_search(message: Message):
+    reset_pending(message.from_user.id)
     if not is_admin(message.from_user.id):
         await message.answer("Нет прав.")
         return
     PENDING_INPUT_MODE[message.from_user.id] = "ticket_search"
-    await message.answer("🔎 Введи поиск по тикетам (тема, @username или id):")
+    await message.answer("🔎 Введи поиск по тикетам (тема, @username или id):", reply_markup=cancel_kb())
 
 
 @router.message(F.text == "/my_tickets")
@@ -1863,6 +2149,15 @@ async def cmd_backup(message: Message, bot: Bot):
         if os.path.exists(CONFIG_PATH):
             zf.write(CONFIG_PATH, arcname="config.json")
     await bot.send_document(message.chat.id, document=open(out_zip, "rb"))
+
+
+@router.message(F.text == "/review_admin")
+async def cmd_review_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    PENDING_INPUT_MODE[message.from_user.id] = "review_admin_id"
+    await message.answer("Введи ID отзыва:", reply_markup=cancel_kb())
 
 
 @router.message(F.text == "/support_cancel")
@@ -2329,6 +2624,16 @@ async def on_btn_help(message: Message):
     await cmd_help(message)
 
 
+@router.message(F.text == BTN_FAQ)
+async def on_btn_faq(message: Message):
+    await cmd_faq(message)
+
+
+@router.message(F.text == BTN_PROFILE)
+async def on_btn_profile(message: Message):
+    await cmd_profile(message)
+
+
 @router.message(F.text == BTN_BACK)
 async def on_btn_back(message: Message):
     await message.answer("🏠 Главное меню:", reply_markup=build_main_menu(message.from_user.id))
@@ -2339,14 +2644,68 @@ async def on_btn_cancel(message: Message):
     await cmd_cancel(message)
 
 
+@router.message(F.text == BTN_HOME)
+async def on_btn_home(message: Message):
+    reset_pending(message.from_user.id)
+    await cmd_start(message)
+
+
 @router.message(F.text == BTN_SUPPORT)
 async def on_btn_support(message: Message):
-    await cmd_support(message)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [make_button("🛟 Создать обращение", "support_new")],
+            [make_button("🧾 Мои тикеты", "support_my")],
+        ]
+    )
+    await message.answer(
+        f"{fmt_header('Техподдержка')}\nВыбери действие:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+@router.message(F.text == BTN_REVIEWS)
+async def on_btn_reviews(message: Message):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [make_button("⭐ Все отзывы", "reviews:all:1")],
+            [make_button("🌍 Сервер", "reviews:server:1"), make_button("🤖 Бот", "reviews:bot:1")],
+        ]
+    )
+    await message.answer(
+        f"{fmt_header('Отзывы')}\nВыбери раздел:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
 
 
 @router.message(F.text == BTN_FEEDBACK)
 async def on_btn_feedback(message: Message):
     await cmd_feedback(message)
+
+
+@router.message(F.text == BTN_MY_TICKETS)
+async def on_btn_my_tickets(message: Message, bot: Bot):
+    await cmd_my_tickets(message, bot)
+
+
+@router.message(F.text == "/reviews")
+async def cmd_reviews(message: Message):
+    reset_pending(message.from_user.id)
+    await send_reviews(message, target=None, page=1)
+
+
+@router.message(F.text == "/reviews_server")
+async def cmd_reviews_server(message: Message):
+    reset_pending(message.from_user.id)
+    await send_reviews(message, target="server", page=1)
+
+
+@router.message(F.text == "/reviews_bot")
+async def cmd_reviews_bot(message: Message):
+    reset_pending(message.from_user.id)
+    await send_reviews(message, target="bot", page=1)
 
 
 @router.message(F.text == BTN_SUPPORT_DONE)
@@ -2605,7 +2964,7 @@ async def on_text(message: Message, bot: Bot):
             rating = int(draft.get("rating") or 0) or None
             with db_connect() as conn:
                 conn.execute(
-                    "INSERT INTO feedback (user_id, username, kind, target, rating, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO feedback (user_id, username, kind, target, rating, message, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         user_id,
                         message.from_user.username,
@@ -2614,6 +2973,7 @@ async def on_text(message: Message, bot: Bot):
                         rating,
                         text,
                         int(time.time()),
+                        "visible",
                     ),
                 )
             await message.answer("✅ Спасибо! Отзыв отправлен.")
@@ -2715,6 +3075,45 @@ async def on_text(message: Message, bot: Bot):
                 lines.append(f"#{tid} — {topic_label} — {subject or '—'} — {who} — {status}")
             await message.answer("\n".join(lines))
             return
+        if mode == "review_admin_id":
+            if not text.isdigit():
+                await message.answer("Нужен числовой ID отзыва.")
+                return
+            fid = int(text)
+            fb = get_feedback(fid)
+            if not fb:
+                await message.answer("Отзыв не найден.")
+                return
+            _id, user_id2, username, target, rating, msg, admin_reply, status, created_at = fb
+            who = f"@{username}" if username else f"id {user_id2}"
+            stars = "⭐" * (rating or 0) if rating else "—"
+            text_out = (
+                f"{fmt_header('Отзыв')}\n"
+                f"{fmt_kv('ID', f'#{fid}')}\n"
+                f"{fmt_kv('Тип', 'сервер' if target=='server' else 'бот')}\n"
+                f"{fmt_kv('Оценка', stars)}\n"
+                f"{fmt_kv('Автор', who)}\n"
+                f"{fmt_kv('Дата', format_date(created_at))}\n"
+                f"{fmt_kv('Статус', status)}\n"
+                f"{fmt_kv('Текст', msg)}"
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [make_button("💬 Ответить", f"review_reply:{fid}")],
+                    [make_button("🙈 Скрыть", f"review_hide:{fid}"), make_button("👁 Показать", f"review_show:{fid}")],
+                    [make_button("🗑 Удалить", f"review_delete:{fid}")],
+                ]
+            )
+            await message.answer(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            return
+        if mode.startswith("review_reply:"):
+            fid = int(mode.split(":", 1)[1])
+            if contains_profanity(text):
+                await message.answer("Пожалуйста, без оскорблений.")
+                return
+            set_feedback_reply(fid, text, user_id)
+            await message.answer("Ответ сохранён.")
+            return
         if mode == "add_admin":
             if not text.isdigit():
                 await message.answer("Нужен числовой Telegram ID.")
@@ -2746,6 +3145,13 @@ async def on_text(message: Message, bot: Bot):
     text = (message.text or "").strip()
     if contains_profanity(text):
         await message.answer("Пожалуйста, без оскорблений.")
+        return
+    if key in YES_NO_KEYS:
+        await message.answer("Выбери вариант кнопкой ✅ Да / ❌ Нет.")
+        return
+    if key == "age" and (not text.isdigit() or not (6 <= int(text) <= 99)):
+        await message.answer("Возраст должен быть числом от 6 до 99.")
+        await send_next_question(bot, message.chat.id, step)
         return
 
     if key == "nick" and (len(text) < 3 or len(text) > 16):
@@ -2865,6 +3271,62 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await call.message.edit_text("🗑️ Анкета отменена.")
         else:
             await call.answer("Нет активной анкеты.")
+        return
+
+    if data == "form_help":
+        await call.answer()
+        await bot.send_message(
+            call.message.chat.id,
+            f"{fmt_header('Анкета')}\n"
+            "Отвечай на вопросы по порядку.\n"
+            "Можно отменить в любой момент: /cancel.\n"
+            "Если ошибся — напиши корректный ответ.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if data == "support_new":
+        await call.answer()
+        await cmd_support(call.message)
+        return
+
+    if data == "support_my":
+        await call.answer()
+        await cmd_my_tickets(call.message, bot)
+        return
+
+    if data == "edit_request":
+        await call.answer()
+        await cmd_edit(call.message, bot)
+        return
+
+    if data.startswith("faq:"):
+        key = data.split(":", 1)[1]
+        if key == "menu":
+            text = f"{fmt_header('FAQ ' + BRAND)}\nВыбери вопрос:"
+            await call.message.edit_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_faq_menu_kb(),
+            )
+            await call.answer()
+            return
+        if key == "home":
+            await call.answer()
+            await call.message.answer("🏠 Главное меню:", reply_markup=build_main_menu(user_id))
+            return
+        match = next((item for item in FAQ_ITEMS if item[0] == key), None)
+        if not match:
+            await call.answer("Вопрос не найден.")
+            return
+        _faq_id, title, answer = match
+        text = f"{fmt_header('FAQ')}\n*{title}*\n{answer}\n\n{fmt_hint('Нажми «Назад», чтобы выбрать другой вопрос')}"
+        await call.message.edit_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_faq_answer_kb(),
+        )
+        await call.answer()
         return
 
     if data.startswith("pending_page:"):
@@ -3005,7 +3467,7 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await call.answer("Тикет закрыт.")
             return
         PENDING_INPUT_MODE[user_id] = f"ticket_reply:{ticket_id}"
-        await bot.send_message(call.message.chat.id, f"Ответ для тикета #{ticket_id}:")
+        await bot.send_message(call.message.chat.id, f"Ответ для тикета #{ticket_id}:", reply_markup=cancel_kb())
         await call.answer()
         return
 
@@ -3057,6 +3519,12 @@ async def on_callback(call: CallbackQuery, bot: Bot):
         await call.answer()
         return
 
+    if data == "cancel_any":
+        reset_pending(user_id)
+        await call.message.edit_text("🗑️ Отменено.")
+        await call.answer()
+        return
+
     if data.startswith("feedback_rating:"):
         try:
             rating = int(data.split(":", 1)[1])
@@ -3096,7 +3564,7 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await call.answer("Тикет закрыт.")
             return
         PENDING_INPUT_MODE[user_id] = f"ticket_add:{ticket_id}"
-        await bot.send_message(call.message.chat.id, f"Добавь сообщение в тикет #{ticket_id}:")
+        await bot.send_message(call.message.chat.id, f"Добавь сообщение в тикет #{ticket_id}:", reply_markup=cancel_kb())
         await call.answer()
         return
 
@@ -3203,7 +3671,7 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await call.answer("Максимум 2 аккаунта.")
             return
         PENDING_INPUT_MODE[user_id] = "account_add"
-        await bot.send_message(call.message.chat.id, "Введи ник для добавления (3–16, латиница/цифры/_):")
+        await bot.send_message(call.message.chat.id, "Введи ник для добавления (3–16, латиница/цифры/_):", reply_markup=cancel_kb())
         await call.answer()
         return
 
@@ -3359,10 +3827,10 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await cmd_pending(call.message, bot, 1)
         elif action == "show":
             PENDING_INPUT_MODE[user_id] = "show"
-            await bot.send_message(call.message.chat.id, "🔎 Введи ID заявки:")
+            await bot.send_message(call.message.chat.id, "🔎 Введи ID заявки:", reply_markup=cancel_kb())
         elif action == "search":
             PENDING_INPUT_MODE[user_id] = "search"
-            await bot.send_message(call.message.chat.id, "Введите поиск (ник, @username или id):")
+            await bot.send_message(call.message.chat.id, "Введите поиск (ник, @username или id):", reply_markup=cancel_kb())
         elif action == "stats":
             await cmd_stats(call.message)
         elif action == "analytics":
@@ -3373,19 +3841,21 @@ async def on_callback(call: CallbackQuery, bot: Bot):
             await cmd_backup(call.message, bot)
         elif action == "dashboard":
             await send_admin_dashboard(bot, call.message.chat.id)
+        elif action == "reviews":
+            await send_reviews(call.message, target=None, page=1)
         elif action == "tickets":
             await send_ticket_list(bot, call.message.chat.id, 1, for_admin=True)
         elif action == "ticket_search":
             PENDING_INPUT_MODE[user_id] = "ticket_search"
-            await bot.send_message(call.message.chat.id, "🔎 Введи поиск по тикетам (тема, @username или id):")
+            await bot.send_message(call.message.chat.id, "🔎 Введи поиск по тикетам (тема, @username или id):", reply_markup=cancel_kb())
         elif action == "health":
             await cmd_health(call.message)
         elif action == "add_admin":
             PENDING_INPUT_MODE[user_id] = "add_admin"
-            await bot.send_message(call.message.chat.id, "Введи Telegram ID для добавления администратора:")
+            await bot.send_message(call.message.chat.id, "Введи Telegram ID для добавления администратора:", reply_markup=cancel_kb())
         elif action == "remove_admin":
             PENDING_INPUT_MODE[user_id] = "remove_admin"
-            await bot.send_message(call.message.chat.id, "Введи Telegram ID для удаления администратора:")
+            await bot.send_message(call.message.chat.id, "Введи Telegram ID для удаления администратора:", reply_markup=cancel_kb())
         elif action == "ban_user":
             PENDING_INPUT_MODE[user_id] = "ban_user"
             await bot.send_message(call.message.chat.id, "Введите Telegram ID для бана:")
@@ -3405,6 +3875,50 @@ async def on_callback(call: CallbackQuery, bot: Bot):
         else:
             await call.answer("Неизвестное действие.")
             return
+        await call.answer()
+        return
+
+    if data.startswith("reviews:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await call.answer("Некорректные данные.")
+            return
+        target = parts[1]
+        try:
+            page = int(parts[2])
+        except Exception:
+            page = 1
+        if target == "all":
+            target = None
+        await send_reviews(call.message, target, page)
+        await call.answer()
+        return
+
+    if data.startswith("review_reply:"):
+        fid = int(data.split(":", 1)[1])
+        PENDING_INPUT_MODE[user_id] = f"review_reply:{fid}"
+        await bot.send_message(call.message.chat.id, "Введи ответ на отзыв:", reply_markup=cancel_kb())
+        await call.answer()
+        return
+
+    if data.startswith("review_hide:"):
+        fid = int(data.split(":", 1)[1])
+        set_feedback_status(fid, "hidden")
+        await call.message.edit_text("Отзыв скрыт.")
+        await call.answer()
+        return
+
+    if data.startswith("review_show:"):
+        fid = int(data.split(":", 1)[1])
+        set_feedback_status(fid, "visible")
+        await call.message.edit_text("Отзыв снова видим.")
+        await call.answer()
+        return
+
+    if data.startswith("review_delete:"):
+        fid = int(data.split(":", 1)[1])
+        delete_feedback(fid)
+        await call.message.edit_text("Отзыв удалён.")
         await call.answer()
         return
 
